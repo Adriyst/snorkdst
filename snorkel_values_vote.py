@@ -56,6 +56,9 @@ class ValueVoter:
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
                 self.woz_label_func, self.dontcare_vote
         ]
+        self.fixing_functions = [
+            self.exclude_slot
+        ]
 
         self.decline = re.compile(r"(^|\s)(now?|wrong)($|\s)")
         self.accept = re.compile(r"(^|\s)(right|yea|correct|yes|yeah)($|\s)")
@@ -108,41 +111,58 @@ class ValueVoter:
     def question_not_request(self, line):
         return re.search(r"is it ([a-z]+)", line) is not None
 
-    def exclude_slot(self, slot: str, x: pd.Series) -> bool:
-        if not (match := self.suggest_option.match(x.system_transcription)):
-            return False
+    def exclude_slot(self, slot: str) -> bool:
 
-        area_type, food_type, price_type = match.groups()
-        food_split = food_type.split() if food_type else []
-        if food_type is not None and\
-                len(food_split) > 2 and\
-                food_split[0] in ("cheap", "moderate", "expensive"):
-                    price_type = food_split[0]
-        right_val = self._deduct_right_val(slot, [food_type, area_type, price_type])
+        def exclude_func(x):
 
-        if self.accept.search(x.transcription):
-            # user confirms that we have the right values
-            return False
-        
-        if self.decline.search(x.transcription):
-            # some goal label is wrong
-            if len([x for x in [area_type, food_type, price_type] if x]) > 1:
-                # multiple slot values, cannot deduct
-                return False
-            if right_val is not None:
-                # negate slot
-                return True
+            aff_func_names = [
+                    self.vote_for_slot(slot).__name__,
+                    self.response_vote(slot).__name__,
+                    self.confirmation_vote(slot).__name__,
+                    self.woz_label_func(slot).__name__
+            ]
+            affected_funcs = [fn.__name__ for fn in 
+                    self.get_labeling_functions_for_slot(slot)
+                    if fn.__name__ in aff_func_names]
 
-            return False
+            return_T = (True, affected_funcs)
+            return_F = (False, affected_funcs)
 
-        if slot in x.transcription or \
-                (slot == "pricerange" and "price range" in x.transcription):
-                    if self.vote_for_slot(slot)(x) >= 0:
-                        # a value was stated in the slot, no need to interfere
-                        return False
-                    # a value was specifically requested, return negative
-                    return True
-        return False
+            if not (match := self.suggest_option.match(x.system_transcription)):
+                return return_F
+
+            area_type, food_type, price_type = match.groups()
+            food_split = food_type.split() if food_type else []
+            if food_type is not None and\
+                    len(food_split) > 2 and\
+                    food_split[0] in ("cheap", "moderate", "expensive"):
+                        price_type = food_split[0]
+            right_val = self._deduct_right_val(slot, [food_type, area_type, price_type])
+
+            if self.accept.search(x.transcription):
+                # user confirms that we have the right values
+                return return_F
+            
+            if self.decline.search(x.transcription):
+                # some goal label is wrong
+                if len([x for x in [area_type, food_type, price_type] if x]) > 1:
+                    # multiple slot values, cannot deduct
+                    return return_F
+                if right_val is not None:
+                    # negate slot
+                    return return_T 
+
+                return return_F
+
+            if slot in x.transcription or \
+                    (slot == "pricerange" and "price range" in x.transcription):
+                        if self.vote_for_slot(slot)(x) >= 0:
+                            # a value was stated in the slot, no need to interfere
+                            return return_F 
+                        # a value was specifically requested, return negative
+                        return return_T
+            return return_F
+        return exclude_func
 
     def find_double_word_value(self, word, transcript, slot):
         double_words = [x.split() for x in self.ontology[slot]
@@ -280,6 +300,9 @@ class ValueVoter:
 
     def get_labeling_functions_for_slot(self, slot):
         return [func(slot) for func in self.labeling_functions]
+
+    def get_fixing_functions_for_slot(self, slot):
+        return [func(slot) for func in self.fixing_functions]
 
     def _deduct_right_val(self, slot, vals):
         return {
