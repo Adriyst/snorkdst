@@ -57,7 +57,7 @@ class ValueVoter:
                 self.woz_label_func, self.dontcare_vote
         ]
         self.fixing_functions = [
-            self.exclude_slot
+                self.exclude_slot, self.whatabout_vote
         ]
 
         self.decline = re.compile(r"(^|\s)(now?|wrong)($|\s)")
@@ -74,6 +74,24 @@ class ValueVoter:
 
         self.exceptions = self.slot_exceptions()
         self.woz_train_votes = self.get_woz_votes("train")
+
+    def whatabout_vote(self, slot):
+
+        def vote_whatabout(x: pd.Series):
+            affected_funcs = [fn.__name__ for fn in 
+                    self.get_labeling_functions_for_slot(slot)]
+
+            return_T = FixingReturn(True, True, affected_funcs) 
+            return_F = FixingReturn(False, True, [])
+            
+            to_match = slot if slot != "pricerange" else "(pricerange|price range)"
+            if not re.search(fr"{to_match}", x.system_transcription):
+                return return_F
+            if not re.search(fr"(what|how) about", x.transcription):
+                return return_F
+            return return_T
+
+        return vote_whatabout
 
 
     def dontcare_vote(self, slot):
@@ -125,8 +143,9 @@ class ValueVoter:
                     self.get_labeling_functions_for_slot(slot)
                     if fn.__name__ in aff_func_names]
 
-            return_T = (True, affected_funcs)
-            return_F = (False, affected_funcs)
+            
+            return_T = FixingReturn(True, False, affected_funcs)
+            return_F = FixingReturn(False, False, [])
 
             if not (match := self.suggest_option.match(x.system_transcription)):
                 return return_F
@@ -349,4 +368,19 @@ class ValueVoter:
                 if not added:
                     votes[slotname].append(-1)
         return votes
+
+class FixingReturn:
+    """
+    Class for return type of fixing functions. Contains three attributes:
+
+     - apply (bool): Whether the function was triggered
+     - mode (bool): Whether it should indicate positive or negative correlation
+                    with chosen functions
+     - affected ([fn]): List of voting function that it should correlate with
+    """
+
+    def __init__(self, apply, mode, affected):
+        self.apply = apply
+        self.positive = mode
+        self.affected = affected
 

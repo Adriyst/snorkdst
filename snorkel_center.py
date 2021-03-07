@@ -28,7 +28,40 @@ class SnorkelCenter:
                 "val_in_text", "val_in_response", "val_in_request",
                 "woz_label", "dontcare_value"
         ]
-        self.func_order.extend([f"{x}_exclude_func" for x in self.func_order])
+        base_funcs = self.func_order.copy()
+        self.func_order.extend([f"{x}_exclude_func" for x in base_funcs])
+        self.func_order.extend([f"{x}_vote_whatabout" for x in base_funcs])
+
+    def get_analyses(self, vote=True, snorkel=True):
+        # 1. create matrix
+        if vote:
+            self._vote_to_frame(self.vote_to_frame)
+
+        analyses = []
+
+        for slot in ["food", "area", "pricerange"]:
+            rel_cols = [col for col in self.dataframe.columns if f"{slot}_lf" in col]
+            matrix = np.array([
+                [int(row[col]) for col in rel_cols]
+                for _, row in self.dataframe.iterrows()
+            ])
+            # For analyses, need all labeling functions
+            # all 5x funcs, then 4x exclude and 5x whatabout
+            fixing_fns = [
+                    labeling_function()(self.value_voter.exclude_slot(slot))
+                    for _ in range(4)]
+            if slot != "area":
+                fixing_fns.extend([labeling_function()(self.value_voter.whatabout_vote(slot))
+                    for _ in range(5)])
+            for fn_idx, fn in enumerate(fixing_fns): 
+                fn.name += f"_{fn_idx}"
+            lab_fns = [labeling_function()(fn) for fn in 
+                    self.value_voter.get_labeling_functions_for_slot(slot)]
+            lab_fns.extend(fixing_fns)
+            analysed = LFAnalysis(L=matrix, lfs=lab_fns)
+            analyses.append(analysed.lf_summary())
+
+        return analyses
  
     def _file_format(self):
         return [{
@@ -176,16 +209,17 @@ class SnorkelCenter:
             
             for _, fix_row in all_in_dial.iterrows():
                 for ff in fixing_functions:
-                    res, funcs = ff(fix_row)
-                    if res == False:
+                    res = ff(fix_row)
+                    if res.apply == False:
                         continue
-                    for affected_func in funcs:
+                    for affected_func in res.affected:
                         col_name = f"{slot}_lf_{affected_func}"
                         fix_col = f"{col_name}_{ff.__name__}"
                         if fix_col not in self.dataframe.columns:
                             self.dataframe[fix_col] = -1
+
                         if (prev_vote := fix_row[col_name]) > -1:
-                            vote = prev_vote + 100
+                            vote = prev_vote if res.positive else prev_vote + 100
                         else:
                             vote = -1
                         self.dataframe.at[fix_row.name, fix_col] = vote
@@ -221,6 +255,89 @@ class SnorkelCenter:
                 matrix.append(votes)
         return matrix, excludeds
 
+
+class LabFuncMap:
+
+    def __init__(self, func1, func2):
+        self.func_1 = func1
+        self.func_2 = func2
+        self.overlap = []
+        self.conflict = []
+
+    def count_overlap(self):
+        return len(self.overlap)
+
+    def count_conflict(self):
+        return len(self.conflict)
+
+
+class LabFunc:
+
+    def __init__(self, name):
+        self.name = name
+
+
+class AnalyzeLFOverview:
+
+    def __init__(self):
+        self.maps = []
+
+    def get_map(self, func_1, func_2):
+        candidates = [m for m in self.maps
+                if func_1.name in (m.func_1.name,m.func_2.name)
+                and func_2.name in (m.func_1.name,m.func_2.name)
+        ]
+        if len(candidates) > 1:
+            raise ValueError("More than one map found for two functions")
+        if len(candidates) == 1:
+            return candidates[0]
+        new_map = LabFuncMap(func_1, func_2)
+        self.maps.append(new_map)
+        return new_map
+
+    def get_maps_for_lf(self, fn):
+        return [m for m in self.maps if fn in (m.func_1.name, m.func_2.name)]
+
+
+
+class Analyzer:
+
+    def __init__(self, dataframe):
+        self.df = dataframe
+
+    def analyze(self, slot):
+        relevant_columns = [col for col in self.df.columns if f"{slot}_lf_" in col]
+        overview = AnalyzeLFOverview()
+        for col in relevant_columns:
+            lf = LabFunc(col)
+            for other_col in [c for c in relevant_columns if c != col]:
+                other_lf = LabFunc(other_col)
+                mapping = overview.get_map(lf, other_lf)
+                    
+                subset = self.df.query(f"{col} > -1 and {other_col} > -1")
+                for _, row in subset.iterrows():
+                    if row[col] == row[other_col]:
+                        mapping.overlap.append(row.name)
+                    else:
+                        mapping.conflict.append(row.name)
+                other_subset = self.df.query(f"{col} > -1 and {other_col} == -1")
+                for _, row in other_subset.iterrows():
+                    mapping.conflict.append(row.name)
+        return overview
+
+    def get_stats_for_fn(self, lf: LabFunc, overview: AnalyzeLFOverview):
+        maps = overview.get_maps_for_lf(lf)
+        overlap = len([m.count_overlap() for m in maps])
+        conflicts = len([m.count_conflict() for m in maps])
+        times_applied = len(self.df.query(f"{lf.name} > -1"))
+        return overlap/times_applied, conflicts/times_applied
+    
+    def structure_analysis(self, overview, slot):
+        lfs = [LabFunc(col) for col in self.df.columns if f"{slot}_lf_" in col]
+        res_df = pd.DataFrame({"overlap": [0]*len(lfs), "conflict": [0]*len(lfs)})
+        res_df.set_index([lf.name for lf in lfs], inplace=True)
+        print(res_df)
+        
 if __name__ == '__main__':
     sc = SnorkelCenter()
-    sc.snorkel_vote()
+    sc.get_analyses()
