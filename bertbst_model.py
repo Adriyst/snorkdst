@@ -105,7 +105,8 @@ class PrePrepped:
             "majority": self.majority_set,
             "snorkel": self.snorkel_set
         }
-        if (relevant_set := loaded_map[version]):
+        relevant_set = loaded_map[version]
+        if relevant_set:
             return relevant_set
 
         mode_map = {
