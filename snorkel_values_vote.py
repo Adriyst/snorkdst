@@ -57,7 +57,7 @@ class ValueVoter:
                 self.woz_label_func, self.dontcare_vote
         ]
         self.fixing_functions = [
-                self.exclude_slot, self.whatabout_vote
+                self.exclude_slot, self.whatabout_vote, self.invalid_vote
         ]
 
         self.decline = re.compile(r"(^|\s)(now?|wrong)($|\s)")
@@ -74,6 +74,19 @@ class ValueVoter:
 
         self.exceptions = self.slot_exceptions()
         self.woz_train_votes = self.get_woz_votes("train")
+
+    def invalid_vote(self, slot):
+        
+        def vote_invalid(x: pd.Series):
+            affected_funcs = [fn.__name__ for fn in
+                    self.get_labeling_functions_for_slot(slot)]
+
+            return_T = FixingReturn(True, False, affected_funcs)
+            return_F = FixingReturn(False, False, [])
+
+            return return_T if x.transcription in self.invalids else return_F
+           
+        return vote_invalid
 
     def whatabout_vote(self, slot):
 

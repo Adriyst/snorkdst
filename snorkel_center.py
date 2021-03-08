@@ -31,6 +31,7 @@ class SnorkelCenter:
         base_funcs = self.func_order.copy()
         self.func_order.extend([f"{x}_exclude_func" for x in base_funcs])
         self.func_order.extend([f"{x}_vote_whatabout" for x in base_funcs])
+        self.func_order.extend([f"{x}_vote_invalid" for x in base_funcs])
 
     def get_analyses(self, vote=True, snorkel=True):
         # 1. create matrix
@@ -203,7 +204,7 @@ class SnorkelCenter:
             # that it should only trigger for the last utterance, correcting 
             # all previous turns.
 
-            all_in_dial = self.dataframe.query(f"dial == {row.dial}")
+            all_in_dial = self.dataframe.query(f"dial == '{row.dial}'")
             if row.name != max(all_in_dial.index.tolist()):
                 continue
             
@@ -296,8 +297,60 @@ class AnalyzeLFOverview:
         return new_map
 
     def get_maps_for_lf(self, fn):
-        return [m for m in self.maps if fn in (m.func_1.name, m.func_2.name)]
+        return [m for m in self.maps if fn.name in (m.func_1.name, m.func_2.name)]
 
+    def get_all_labfuncs(self):
+        lfs = []
+        for map in self.maps:
+            if map.func_1 not in lfs:
+                lfs.append(map.func_1)
+            if map.func_2 not in lfs:
+                lfs.append(map.func_2)
+        return lfs
+
+
+class FuncStats:
+
+    def __init__(self, maps, lf, df):
+        self.maps = maps
+        self.lf_col = lf.name
+        self.overlap_rate = 0
+        self.conflict_rate = 0
+        self.overlap_turn_count = 0
+        self.conflict_turn_count = 0
+        self.overlap_total_count = 0
+        self.conflict_total_count = 0
+        self.times_applied = len(df.query(f"{lf.name} > -1"))
+        self.parse()
+
+    def parse(self):
+        overlap_turns, conflict_turns = [], []
+        for m in self.maps:
+            overlap_turns.extend(m.overlap)
+            conflict_turns.extend(m.conflict)
+        overlap = len(set(overlap_turns))
+        conflict = len(set(conflict_turns))
+        if self.times_applied > 0:
+            self.overlap_rate = overlap/self.times_applied
+            self.conflict_rate = conflict/self.times_applied
+
+        self.overlap_turn_count = overlap
+        self.conflict_turn_count = conflict
+        self.overlap_total_count = len(overlap_turns)
+        self.conflict_total_count = len(conflict_turns)
+
+
+class FuncStatsPandas:
+
+    def __init__(self, fstats):
+        self.fstats = fstats
+
+    def create_pandas(self):
+        shell = {k: [] for k in dir(self.fstats[0]) if ("conflict" in k or "overlap" in k)}
+        for col, nums in shell.items():
+            for fstat in self.fstats:
+                nums.append(getattr(fstat, col))
+        return pd.DataFrame(shell, index=[fstat.lf_col for fstat in self.fstats])
 
 
 class Analyzer:
@@ -320,23 +373,18 @@ class Analyzer:
                         mapping.overlap.append(row.name)
                     else:
                         mapping.conflict.append(row.name)
-                other_subset = self.df.query(f"{col} > -1 and {other_col} == -1")
-                for _, row in other_subset.iterrows():
-                    mapping.conflict.append(row.name)
         return overview
 
     def get_stats_for_fn(self, lf: LabFunc, overview: AnalyzeLFOverview):
         maps = overview.get_maps_for_lf(lf)
-        overlap = len([m.count_overlap() for m in maps])
-        conflicts = len([m.count_conflict() for m in maps])
-        times_applied = len(self.df.query(f"{lf.name} > -1"))
-        return overlap/times_applied, conflicts/times_applied
+        return FuncStats(maps, lf, self.df)
     
     def structure_analysis(self, overview, slot):
-        lfs = [LabFunc(col) for col in self.df.columns if f"{slot}_lf_" in col]
-        res_df = pd.DataFrame({"overlap": [0]*len(lfs), "conflict": [0]*len(lfs)})
-        res_df.set_index([lf.name for lf in lfs], inplace=True)
+        lfs = overview.get_all_labfuncs()
+        fspd = FuncStatsPandas([self.get_stats_for_fn(lf, overview) for lf in lfs])
+        res_df = fspd.create_pandas()
         print(res_df)
+        return res_df
         
 if __name__ == '__main__':
     sc = SnorkelCenter()
