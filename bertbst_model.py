@@ -97,7 +97,7 @@ class PrePrepped:
         self.majority_set = None
         self.snorkel_set = None
 
-    def fetch_set(self, version):
+    def fetch_set(self, version, **kwargs):
         loaded_map = {
             "train": self.train_set,
             "validate": self.validate_set,
@@ -119,7 +119,7 @@ class PrePrepped:
         version_type = mode_map[version]
         loaded_set = dataset_dstc2.create_examples(
             os.path.join(self.BASE_PATH, f"dstc2_{version}_en.json"),
-            self.SLOTS, version_type
+            self.SLOTS, version_type, **kwargs
         )
         loaded_map[version] = loaded_set
         return loaded_set
@@ -206,6 +206,7 @@ class BertNet(nn.Module):
         self.alphabeta_area = nn.Linear(emb_dim, 2)
         self.alphabeta_price = nn.Linear(emb_dim, 2)
 
+        self.activation = nn.ReLU()
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(p=0.3)
         self.loss_fn = nn.CrossEntropyLoss()
@@ -224,7 +225,7 @@ class BertNet(nn.Module):
         self.optim = Adam(self.parameters(), lr=2e-5)
 
         self.epochs = 30
-        self.train_bsize = 8
+        self.train_bsize = 32
 
         self.slots = ["food", "area", "pricerange"]
         self.ontology = DataFetcher.fetch_dstc_ontology()["informable"]
@@ -295,63 +296,220 @@ class BertNet(nn.Module):
                 torch.save(self.state_dict(), open(f"./bertdst-light-{mode}.pt", "wb"))
                 torch.save(self.bert.state_dict(), open(f"./light-bertstate-{mode}.pt", "wb"))
             logger.info("#" * 30)
-            
-    def predict(self, mode="validate"):
+
+
+    def develop(self, mode="validate"):
         self.eval()
         self.bert.eval()
-        good, bad = 0, 0
-        featureset = self.preprep.fetch_set(mode)
-        dial_struct = []
-        current_id = ""
-        current_dial = []
-        for turn in featureset:
-            _, dial_no, turn_no = turn.guid.split("-")
-            if dial_no != current_id:
-                current_id = dial_no
-                if len(current_dial) > 0:
-                    dial_struct.append(sorted(current_dial, key=lambda x: turn_no))
-                    current_dial = []
-                current_dial.append(turn)
-            else:
-                current_dial.append(turn)
-        else:
-            dial_struct.append(sorted(current_dial, key= lambda x: turn_no))
-
-        cls_error_fasit = 0
-        cls_error_pred = 0
-        pos_error = 0
-        dontcare_error = 0
-        tralse = True
-        slot_misses = FreqDist()
+        dial_struct = self._fetch_predictset(mode)
+        random.shuffle(dial_struct)
 
         for dial in dial_struct:
-            nully = True
-            pos_correct = {k:True for k in self.slots}
+            goal_labs = {k:True for k in self.slots}
             for turn in dial:
-                with torch.no_grad():
-                    class_logits, pos_logits = self(
-                            { k: check_cuda_long(v) for k, v in  
-                                self.tokenizer.encode_plus(
-                                    turn.text_a, turn.text_b, return_tensors="pt"
-                                ).items()
-                                }, train=False
-                    )
-                predset = PredictionSet(*class_logits, *pos_logits)
-                
+                predset = self._get_predset(turn)
                 for slot in ["food", "area", "price range"]:
                     p_slot = slot if slot != "price range" else "pricerange"
                     pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
                     pred_pos = predset.eval_format(p_slot)
 
-                    #if tralse:
-                    #    print(p_slot)
-                    #    print(predset.cat_map[p_slot]["class"])
-                    #    print(turn.class_label[slot])
-                    #    print(turn.session_id)
-                    #    print(turn.guid)
-                    #    q = input()
-                    #    if q == "q":
-                    #        tralse = False
+                    if pred_cls == 2:
+                        if turn.class_label[slot] != "copy_value":
+                            goal_labs[p_slot] = False
+                            print("Wrong class prediction for dial", turn.session_id)
+                            self._turn_error_print(turn, pred_cls, pred_pos, slot)
+                            print("¤"*30)
+                            print()
+                            input()
+                        else:
+                            print(f"Right class prediction for slot {slot}")
+                            self._turn_error_print(turn, pred_cls, pred_pos, slot)
+                            print("¤"*40)
+                            print()
+
+
+    def _turn_error_print(self, turn: dataset_dstc2.InputExample,
+                                predicted_class: str,
+                                predicted_idx: int,
+                                slot: str):
+        pred_pos = np.where(np.array(predicted_idx) == 1)[0]
+        pred_value = turn.text_a + turn.text_b
+        pred_slotval = []
+        for p in pred_pos:
+            pred_slotval.append(pred_value[p])
+
+        hit_index = np.array(turn.text_a_label[slot] + turn.text_b_label[slot])
+        hit_goal = np.where(hit_index == 1)[0]
+
+        inp_class_labs = ["none", "dontcare", "copy_value"]
+            
+        print("Predicted class:", predicted_class)
+        print("Actual class:", inp_class_labs.index(turn.class_label[slot]))
+        print("Predicted indexes:", pred_pos)
+        print("Actual indexes:", hit_goal)
+        print("¤"*30)
+        print()
+        print("For slot", slot)
+        print("Turn text_a:", turn.text_a)
+        print("Turn text_b:", turn.text_b)
+        print("Turn text_a_label:", turn.text_a_label)
+        print("Turn text_b_label:", turn.text_b_label)
+        print("For predicted value", " ".join(pred_slotval))
+        print("¤"*30)
+        print()
+        print("Class label:", turn.class_label[slot])
+        print("Indexes to hit:", hit_goal)
+
+
+    def predict_v2(self, mode="validate"):
+        self.eval()
+        self.bert.eval()
+        good, bad = 0, 0
+        dials = self._fetch_predictset(mode)
+        real_set = DataFetcher.fetch_clean_dstc(mode, parse_labels=True)
+        for dial in dials:
+            nully = True
+            corr_slot = {k:True for k in self.slots}
+            predz = {k: "none" for k in self.slots}
+            for turn in dial:
+                slot_plus_idx = {k: 0 for k in self.slots}
+                predset = self._get_predset(turn)
+                predstring = ""
+                for slot in ["food", "area", "price range"]:
+                    p_slot = slot if slot != "price range" else "pricerange"
+                    pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
+                    pred_pos = predset.eval_format(p_slot)
+                    if turn.class_label[slot] == "copy_value":
+                        nully = False
+                        if pred_cls != 2:
+                            predstring += ",bad"
+                            corr_slot[p_slot] = False
+                            continue
+
+                        labs = turn.text_a_label[slot].copy() +\
+                            turn.text_b_label[slot].copy()
+                        while len(labs) < len(pred_pos):
+                            labs.append(0)
+
+                        for xlab, xtext in zip([turn.text_a_label, turn.text_b_label],
+                                    [turn.text_a, turn.text_b]):
+                                if sum(xlab[slot]) > 0:
+                                    rel = np.array(xlab[slot])
+                                    num = np.where(rel == 1)[0]
+                                    tru_idx = []
+                                    for idx in num:
+                                        tru_idx.append(xtext[idx])
+                                    predz[p_slot] = " ".join(tru_idx)
+
+                        if labs != pred_pos:
+                            corr_slot[p_slot] = False
+                            predstring += ",bad"
+                        else:
+                            corr_slot[p_slot] = True
+                            slot_plus_idx[p_slot] = labs
+                            predstring += ",good"
+
+                    elif turn.class_label[slot] == "dontcare":
+                        nully = False
+                        if pred_cls != 1:
+                            predstring += ",bad"
+                            corr_slot[p_slot] = False
+                        else:
+                            corr_slot[p_slot] = True
+                            slot_plus_idx[p_slot] = labs
+                            predstring += ",good"
+                            predz[p_slot] = "dontcare"
+                    else:
+                        if pred_cls != 0:
+                            nully = False
+                            predstring += ",bad"
+                            corr_slot[p_slot] = False
+                        else:
+                            predstring += ",good"
+                            
+                if nully:
+                    continue
+                if predstring == ",good,good,good" and all(corr_slot.values()):
+                    good += 1
+                    real_goals = [dial for dial in real_set.dialogues
+                            if dial.id == turn.session_id]
+                    real_turn = real_goals[0].turns[int(turn.guid.split("-")[-1])]
+                    real_labs = real_turn.goal_labels
+                    print(turn.session_id)
+                    print("-"*30)
+                    print(turn.text_a)
+                    print(turn.text_b)
+                    print(predz)
+                    print(real_labs)
+                    print("wtf")
+                    input()
+
+                    if predz != real_turn.goal_labels:
+                        for k,v in predz.items():
+                            if k not in real_labs:
+                                print(turn.text_a)
+                                print(turn.text_b)
+                                print(predz)
+                                print(real_labs)
+                                print("wtf")
+                                input()
+                            if real_labs[k] != predz[k]:
+                                if real_labs[k] in SEMANTIC_DICT and v in \
+                                        SEMANTIC_DICT[real_labs[k]]:
+                                            continue
+
+                                print(real_labs)
+                                print(predz)
+                                print(turn.session_id)
+                                input()
+
+                else:
+                    bad += 1
+        print("goods:", good)
+        print("bads:", bad)
+        print("acc:", good/(good + bad))
+
+
+    def predict(self, mode="validate"):
+        self.eval()
+        self.bert.eval()
+        good, bad = 0, 0
+        
+        cls_error_fasit = 0
+        cls_error_pred = 0
+        pos_error = 0
+        dontcare_error = 0
+        slot_misses = FreqDist()
+        dial_struct = self._fetch_predictset(mode)
+        currid = ""
+        lastid = ""
+
+        for dial in dial_struct:
+            nully = True
+            pos_correct = {k:True for k in self.slots}
+            for turn in dial:
+                if currid != turn.session_id:
+                    currid = turn.session_id
+
+                predset = None
+                if len(turn.text_b) > 0:
+                    with torch.no_grad():
+                        class_logits, pos_logits = self(
+                                { k: check_cuda_long(v) for k, v in  
+                                    self.tokenizer.encode_plus(
+                                        turn.text_a, turn.text_b, return_tensors="pt"
+                                    ).items()
+                                    }, train=False
+                        )
+                    predset = PredictionSet(*class_logits, *pos_logits)
+
+                for slot in ["food", "area", "price range"]:
+                    p_slot = slot if slot != "price range" else "pricerange"
+                    if predset:
+                        pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
+                        pred_pos = predset.eval_format(p_slot)
+                    else:
+                        pred_cls = 0
 
                     if turn.class_label[slot] == "copy_value":
                         nully = False
@@ -366,7 +524,7 @@ class BertNet(nn.Module):
                         while len(labs) < len(pred_pos):
                             labs.append(0)
 
-                        if labs != pred_pos: 
+                        if labs != pred_pos:
                             pos_correct[p_slot] = False
                             pos_error += 1
                         else:
@@ -415,17 +573,17 @@ class BertNet(nn.Module):
             comb = self.dropout(comb)
             seq = self.dropout(seq)
 
-        a_food = self.softmax(self.food_a(comb))
-        a_area = self.softmax(self.area_a(comb))
-        a_price = self.softmax(self.price_a(comb))
+        a_food = self.activation(self.food_a(comb))
+        a_area = self.activation(self.area_a(comb))
+        a_price = self.activation(self.price_a(comb))
 
         food_ab = self.alphabeta_food(seq)
         area_ab = self.alphabeta_area(seq)
         price_ab = self.alphabeta_price(seq)
 
         def get_alphabeta(tensor):
-            alphamax = self.softmax(tensor[:, :, 0])
-            betamax = self.softmax(tensor[:, :, 1])
+            alphamax = self.activation(tensor[:, :, 0])
+            betamax = self.activation(tensor[:, :, 1])
             return alphamax, betamax
 
         foodstart, foodend = get_alphabeta(food_ab)
@@ -436,6 +594,40 @@ class BertNet(nn.Module):
                 ((foodstart, foodend),
                 (areastart, areaend),
                 (pricestart, priceend)))
+
+    def _get_predset(self, turn, train=False):
+        with torch.no_grad():
+            class_logits, pos_logits = self(
+                { k: check_cuda_long(v) for k, v in  
+                    self.tokenizer.encode_plus(
+                        turn.text_a, turn.text_b, return_tensors="pt"
+                    ).items()
+                }, train=train
+            )
+            return PredictionSet(*class_logits, *pos_logits)
+
+    def _fetch_predictset(self, mode):
+        """
+        Helper function to generate a featureset for the predict and develop functions.
+        """
+        featureset = self.preprep.fetch_set(mode, use_asr_hyp=1)
+        dial_struct = []
+        current_id = ""
+        current_dial = []
+        for turn in featureset:
+            _, dial_no, turn_no = turn.guid.split("-")
+            if dial_no != current_id:
+                current_id = dial_no
+                if len(current_dial) > 0:
+                    dial_struct.append(sorted(current_dial, key=lambda x: turn_no))
+                    current_dial = []
+                current_dial.append(turn)
+            else:
+                current_dial.append(turn)
+        else:
+            dial_struct.append(sorted(current_dial, key= lambda x: turn_no))
+        return dial_struct
+
 
 def check_cuda_float(list_like):
     to_ret = torch.FloatTensor(list_like)
@@ -620,24 +812,20 @@ if __name__ == '__main__':
 
     arg = sys.argv[1]
     bn = BertNet()
-    if arg == "train":
-        bn.fit()
-    elif arg == "majority":
-        bn.fit(mode="majority")
-    elif arg == "snorkel":
-        bn.fit(mode="snorkel")
+    if arg in ("train", "majority", "snorkel"):
+        bn.fit(mode=arg)
     elif arg == "validate":
-        bn.load_state_dict(torch.load("./bertdst-light.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate.pt"))
+        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
+        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
         bn.predict()
     elif arg == "test":
         bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
         bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
         bn.predict(mode="test")
     elif arg == "dev":
-        bn.load_state_dict(torch.load("./bertdst-light.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate.pt"))
-        bn.predict()
+        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
+        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
+        bn.develop()
     elif arg == "majority_test":
         bn.load_state_dict(torch.load("./bertdst-light-majority.pt"))
         bn.bert.load_state_dict(torch.load("light-bertstate-majority.pt"))
@@ -646,4 +834,13 @@ if __name__ == '__main__':
         bn.load_state_dict(torch.load("./bertdst-light-snorkel.pt"))
         bn.bert.load_state_dict(torch.load("light-bertstate-snorkel.pt"))
         bn.predict(mode="test")
+    elif arg == "new":
+        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
+        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
+        bn.predict_v2()
+    elif arg == "newtest":
+        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
+        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
+        bn.predict_v2(mode="test")
+
 
