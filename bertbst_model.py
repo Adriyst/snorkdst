@@ -95,7 +95,9 @@ class PrePrepped:
         self.validate_set = None
         self.test_set = None
         self.majority_set = None
+        self.majority_pattern_matching_set = None
         self.snorkel_set = None
+        self.snorkel_pattern_matching_set = None
 
     def fetch_set(self, version, **kwargs):
         loaded_map = {
@@ -103,7 +105,9 @@ class PrePrepped:
             "validate": self.validate_set,
             "test": self.test_set,
             "majority": self.majority_set,
-            "snorkel": self.snorkel_set
+            "majority_pattern_matching": self.majority_pattern_matching_set,
+            "snorkel": self.snorkel_set,
+            "snorkel_pattern_matching": self.snorkel_pattern_matching_set
         }
         relevant_set = loaded_map[version]
         if relevant_set:
@@ -112,11 +116,9 @@ class PrePrepped:
         mode_map = {
             "train": "train",
             "validate": "dev",
-            "test": "test",
-            "majority": "train",
-            "snorkel": "train"
+            "test": "test"
         }
-        version_type = mode_map[version]
+        version_type = mode_map[version] if version in mode_map else mode_map["train"]
         loaded_set = dataset_dstc2.create_examples(
             os.path.join(self.BASE_PATH, f"dstc2_{version}_en.json"),
             self.SLOTS, version_type, **kwargs
@@ -129,7 +131,7 @@ class DataLoader:
 
     def __init__(self):
         self.tokenizer = tokenization.FullTokenizer(
-                vocab_file="/usr/local/Development/bert/vocab.txt",
+                vocab_file=BERT_VOCAB_LOC,
                 do_lower_case=True
         )
 
@@ -206,7 +208,7 @@ class BertNet(nn.Module):
         self.alphabeta_area = nn.Linear(emb_dim, 2)
         self.alphabeta_price = nn.Linear(emb_dim, 2)
 
-        self.activation = nn.ReLU()
+        self.activation = nn.Sigmoid()
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(p=0.3)
         self.loss_fn = nn.CrossEntropyLoss()
@@ -573,17 +575,17 @@ class BertNet(nn.Module):
             comb = self.dropout(comb)
             seq = self.dropout(seq)
 
-        a_food = self.activation(self.food_a(comb))
-        a_area = self.activation(self.area_a(comb))
-        a_price = self.activation(self.price_a(comb))
+        a_food = self.food_a(comb)
+        a_area = self.area_a(comb)
+        a_price = self.price_a(comb)
 
         food_ab = self.alphabeta_food(seq)
         area_ab = self.alphabeta_area(seq)
         price_ab = self.alphabeta_price(seq)
 
         def get_alphabeta(tensor):
-            alphamax = self.activation(tensor[:, :, 0])
-            betamax = self.activation(tensor[:, :, 1])
+            alphamax = tensor[:, :, 0]
+            betamax = tensor[:, :, 1]
             return alphamax, betamax
 
         foodstart, foodend = get_alphabeta(food_ab)
@@ -812,35 +814,19 @@ if __name__ == '__main__':
 
     arg = sys.argv[1]
     bn = BertNet()
-    if arg in ("train", "majority", "snorkel"):
+    if arg in ("train", "majority", "snorkel", "majority_pattern_matching",
+            "snorkel_pattern_matching"):
         bn.fit(mode=arg)
+    elif arg in ("test", "majority_test", "majority_pattern_matching_test",
+            "snorkel_test", "snorkel_pattern_matching_test"):
+        arg == "train" if arg == "test" else arg
+        if len(arg.split("_")) == 2:
+            arg = arg.split("_")[0]
+        bn.load_state_dict(torch.load(f"./bertdst-light-{arg}.pt"))
+        bn.bert.load_state_dict(torch.load(f"light-bertstate-{arg}.pt"))
+        bn.predict(mode="test")
     elif arg == "validate":
         bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
         bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
         bn.predict()
-    elif arg == "test":
-        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
-        bn.predict(mode="test")
-    elif arg == "dev":
-        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
-        bn.develop()
-    elif arg == "majority_test":
-        bn.load_state_dict(torch.load("./bertdst-light-majority.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-majority.pt"))
-        bn.predict(mode="test")
-    elif arg == "snorkel_test":
-        bn.load_state_dict(torch.load("./bertdst-light-snorkel.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-snorkel.pt"))
-        bn.predict(mode="test")
-    elif arg == "new":
-        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
-        bn.predict_v2()
-    elif arg == "newtest":
-        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
-        bn.predict_v2(mode="test")
-
 

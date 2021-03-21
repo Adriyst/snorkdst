@@ -142,7 +142,7 @@ class ValueVoter:
     def question_not_request(self, line):
         return re.search(r"is it ([a-z]+)", line) is not None
 
-    def exclude_slot(self, slot: str) -> bool:
+    def exclude_slot(self, slot: str):
 
         def exclude_func(x):
 

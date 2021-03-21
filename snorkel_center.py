@@ -383,7 +383,6 @@ class Analyzer:
         lfs = overview.get_all_labfuncs()
         fspd = FuncStatsPandas([self.get_stats_for_fn(lf, overview) for lf in lfs])
         res_df = fspd.create_pandas()
-        print(res_df)
         return res_df
         
 if __name__ == '__main__':
