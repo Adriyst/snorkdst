@@ -1,6 +1,7 @@
 from snorkel.labeling import LFAnalysis, PandasLFApplier, labeling_function
 from snorkel.labeling.model import LabelModel
 
+import re
 import pandas as pd
 import numpy as np
 from nltk import FreqDist
@@ -446,7 +447,8 @@ class FormatEntry:
         for column, op in zip(self.order, self.operations):
             # special case
             if column == "name":
-                num = self.row.name
+                removed_first_part = re.sub(r"\w+_lf_", "", self.row.name)
+                num = removed_first_part.replace("_", "")
             elif isinstance(column, str):
                 num = self.operation_map[op](self.row[column])
             elif isinstance(column, tuple):
