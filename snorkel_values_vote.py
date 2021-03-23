@@ -81,8 +81,8 @@ class ValueVoter:
             affected_funcs = [fn.__name__ for fn in
                     self.get_labeling_functions_for_slot(slot)]
 
-            return_T = FixingReturn(True, False, affected_funcs)
-            return_F = FixingReturn(False, False, [])
+            return_T = FixingReturn(True, False, affected_funcs, vote_invalid)
+            return_F = FixingReturn(False, False, [], vote_invalid)
 
             return return_T if x.transcription in self.invalids else return_F
            
@@ -94,8 +94,8 @@ class ValueVoter:
             affected_funcs = [fn.__name__ for fn in 
                     self.get_labeling_functions_for_slot(slot)]
 
-            return_T = FixingReturn(True, True, affected_funcs) 
-            return_F = FixingReturn(False, True, [])
+            return_T = FixingReturn(True, True, affected_funcs, vote_whatabout) 
+            return_F = FixingReturn(False, True, [], vote_whatabout)
             
             to_match = slot if slot != "pricerange" else "(pricerange|price range)"
             if not re.search(fr"{to_match}", x.system_transcription):
@@ -157,8 +157,8 @@ class ValueVoter:
                     if fn.__name__ in aff_func_names]
 
             
-            return_T = FixingReturn(True, False, affected_funcs)
-            return_F = FixingReturn(False, False, [])
+            return_T = FixingReturn(True, False, affected_funcs, exclude_func)
+            return_F = FixingReturn(False, False, [], exclude_func)
 
             if not (match := self.suggest_option.match(x.system_transcription)):
                 return return_F
@@ -192,6 +192,8 @@ class ValueVoter:
                             # a value was stated in the slot, no need to interfere
                             return return_F 
                         # a value was specifically requested, return negative
+                        # need check for 'type of food' or something
+
                         return return_T
             return return_F
         return exclude_func
@@ -392,8 +394,9 @@ class FixingReturn:
      - affected ([fn]): List of voting function that it should correlate with
     """
 
-    def __init__(self, apply, mode, affected):
+    def __init__(self, apply, mode, affected, ff):
         self.apply = apply
         self.positive = mode
         self.affected = affected
+        self.ff = ff
 

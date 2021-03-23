@@ -189,6 +189,12 @@ class SnorkelCenter:
         # In order to fit a snorkel model, we need to create an
         # actual matrix. Probably best to add new rows to the frame 
         # originally.
+        
+        # keep a list of which fixing functions are to be applied
+        # to each dial
+        dials_to_fix = {}
+        fixer = DialogueFixing(slot)
+
         for _, row in self.dataframe.iterrows():
             for lf in labeling_functions:
                 col_name = f"{slot}_lf_{lf.__name__}"
@@ -205,26 +211,15 @@ class SnorkelCenter:
             # all previous turns.
 
             all_in_dial = self.dataframe.query(f"dial == '{row.dial}'")
-            if row.name != max(all_in_dial.index.tolist()):
-                continue
-            
+            if row.dial not in fixer.fixing_results:
+                fixer.fixing_results[row.dial] = []
+
             for _, fix_row in all_in_dial.iterrows():
                 for ff in fixing_functions:
                     res = ff(fix_row)
-                    if res.apply == False:
-                        continue
-                    for affected_func in res.affected:
-                        col_name = f"{slot}_lf_{affected_func}"
-                        fix_col = f"{col_name}_{ff.__name__}"
-                        if fix_col not in self.dataframe.columns:
-                            self.dataframe[fix_col] = -1
-
-                        if (prev_vote := fix_row[col_name]) > -1:
-                            vote = prev_vote if res.positive else prev_vote + 100
-                        else:
-                            vote = -1
-                        self.dataframe.at[fix_row.name, fix_col] = vote
+                    fixer.fixing_results[row.dial].append(res)
                         
+        fixer.apply(self.dataframe)
 
     def generate_voting_matrix(self, slot, labeling_functions):
         """
@@ -321,6 +316,7 @@ class FuncStats:
         self.overlap_total_count = 0
         self.conflict_total_count = 0
         self.times_applied = len(df.query(f"{lf.name} > -1"))
+        self.coverage = self.times_applied/len(df)
         self.parse()
 
     def parse(self):
@@ -343,10 +339,17 @@ class FuncStats:
 class FuncStatsPandas:
 
     def __init__(self, fstats):
-        self.fstats = fstats
+        filtered = []
+        blacklist = []
+        for fst in fstats:
+            if fst.lf_col not in blacklist:
+                filtered.append(fst)
+                blacklist.append(fst.lf_col)
+        self.fstats = filtered
 
     def create_pandas(self):
-        shell = {k: [] for k in dir(self.fstats[0]) if ("conflict" in k or "overlap" in k)}
+        shell = {k: [] for k in dir(self.fstats[0]) if ("conflict" in k or "overlap" in k
+            or "coverage" in k)}
         for col, nums in shell.items():
             for fstat in self.fstats:
                 nums.append(getattr(fstat, col))
@@ -379,12 +382,105 @@ class Analyzer:
         maps = overview.get_maps_for_lf(lf)
         return FuncStats(maps, lf, self.df)
     
-    def structure_analysis(self, overview, slot):
+    def structure_analysis(self, overview):
         lfs = overview.get_all_labfuncs()
         fspd = FuncStatsPandas([self.get_stats_for_fn(lf, overview) for lf in lfs])
         res_df = fspd.create_pandas()
         return res_df
         
+
+class DialogueFixing:
+
+    def __init__(self, slot):
+        ## list of fixingresults
+        self.fixing_results = {}
+        self.slot = slot
+
+    def apply(self, dataframe):
+        for dialogue, results in self.fixing_results.items():
+            affected_dialogue = dataframe.query(f"dial == '{dialogue}'")
+            if len(affected_dialogue) == 0:
+                print("empty dial?? - ", dialogue)
+                continue
+            for res in results:
+                vote = -1
+                for affected_func in res.affected:
+                    col_name = f"{self.slot}_lf_{affected_func}"
+                    fix_col_name = f"{col_name}_{res.ff.__name__}"
+                    if fix_col_name not in dataframe:
+                        dataframe[fix_col_name] = -1
+                    for _, affected_utt in affected_dialogue.query(
+                            f"{col_name} > -1"
+                    ).iterrows():
+                        vote = -1 
+                        if res.apply:
+                            vote = affected_utt[col_name]
+                            if not res.positive:
+                                vote += 100
+                        dataframe.at[affected_utt.name, fix_col_name] = vote
+
+
+class FormatEntry:
+    """
+    Object representation of a row in a dataframe, that is to be formatted
+    with latex
+    """
+
+    def __init__(self, row, order, operations):
+        self.row = row
+        self.order = order
+        self.operations = operations
+        self.operation_map = {
+            "name": lambda x: x,
+            "perc": lambda x: round(x*100, 3) if x > 0 else 0,
+            "rate": lambda x,y: round(x/y, 2) if x > 0 else 0
+        }
+        self.postfixes = {
+            "name": "",
+            "perc": "\%",
+            "rate": ""
+        }
+
+    def generate_format_string(self):
+        s = ""
+        for column, op in zip(self.order, self.operations):
+            # special case
+            if column == "name":
+                num = self.row.name
+            elif isinstance(column, str):
+                num = self.operation_map[op](self.row[column])
+            elif isinstance(column, tuple):
+                nums = []
+                for col in column:
+                    nums.append(self.row[col])
+                num = self.operation_map[op](*nums)
+
+            s += str(num)
+            s += self.postfixes[op]
+            s += " & "
+        s = s[:-2]
+        s += "\\\\"
+        return s
+
+class LatexFormatter:
+
+    ORDER = ["name", "coverage", "overlap_rate",
+            ("overlap_total_count","overlap_turn_count"), "conflict_rate",
+            ("conflict_total_count", "conflict_turn_count")]
+    OPERATIONS = ["name", "perc", "perc", "rate", "perc", "rate"]
+
+    def __init__(self, dataframe):
+        self.dataframe = dataframe
+
+    def format(self):
+        table_rows = []
+        for _, row in self.dataframe.iterrows():
+            entry = FormatEntry(row, self.ORDER, self.OPERATIONS)
+            table_rows.append(entry.generate_format_string())
+        return table_rows
+
+
+
 if __name__ == '__main__':
     sc = SnorkelCenter()
     sc.get_analyses()
