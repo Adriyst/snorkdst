@@ -54,16 +54,16 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.woz_label_func, self.dontcare_vote
+                self.dontcare_vote, #self.woz_label_func, self.dontcare_vote
         ]
         self.fixing_functions = [
                 self.exclude_slot, self.whatabout_vote, self.invalid_vote
         ]
 
         self.decline = re.compile(r"(^|\s)(now?|wrong)($|\s)")
-        self.accept = re.compile(r"(^|\s)(right|yea|correct|yes|yeah)($|\s)")
-        self.dontcare = re.compile(r"(^any$|dont care|do not care|dontcare|care|it doesnt"\
-                    " matter|none)")
+        self.accept = re.compile(r"(^|\s)(right|yea?|correct|yes|yeah)($|\s)")
+        self.dontcare = lambda slot: re.compile(rf"(^any( ({slot}|kind))?|dont care|do not "\
+                "care|dontcare|care|(it )?doesnt matter|none|dont know|anything|what ?ever)")
 
         self.suggest_option = re.compile(
                 r"^(?:(?:\w+\s?){1,6}) is a (?:nice|great) restaurant"\
@@ -113,7 +113,7 @@ class ValueVoter:
         }
 
         def dontcare_value(x: pd.Series):
-            if self.dontcare.search(x.transcription):
+            if self.dontcare(slot).search(x.transcription):
                 search_phrase = slot if slot != "pricerange" else "(pricerange|price range)"
                 if re.search(rf"{search_phrase}", x.system_transcription) or \
                         (x.system_transcription in phrases and\
@@ -201,6 +201,10 @@ class ValueVoter:
     def find_double_word_value(self, word, transcript, slot):
         double_words = [x.split() for x in self.ontology[slot]
                 if len(x.split()) > 1]
+        double_words.extend([
+            x.split() for y in self.alternatives.values() 
+            for x in y if len(x.split()) > 1
+        ])
         is_first = [x for x in double_words if word == x[0]]
         whole_transcript = transcript.split()
         possibilities = []
@@ -209,18 +213,16 @@ class ValueVoter:
                 if (w_idx := whole_transcript.index(word)) == len(whole_transcript) - 1:
                     # last word, no way
                     continue
-                if (attempt := whole_transcript[w_idx:w_idx+1]) == candidate:
+                if (attempt := whole_transcript[w_idx:w_idx+2]) == candidate:
                     possibilities.append(" ".join(attempt))
-                    continue
 
         is_second = [x for x in double_words if word == x[1]]
         if len(is_second) > 0:
             for candidate in is_second:
                 if (w_idx := whole_transcript.index(word)) == 0:
                     continue
-                if (attempt := whole_transcript[w_idx-1:w_idx]) == candidate:
+                if (attempt := whole_transcript[w_idx-1:w_idx+1]) == candidate:
                     possibilities.append(" ".join(attempt))
-                    continue
         return possibilities
 
     def vote_for_slot(self, slot):
@@ -260,7 +262,7 @@ class ValueVoter:
                         return -1
             if x.system_transcription != self.request_statements[slot]:
                 return -1
-            if self.dontcare.search(x.transcription):
+            if self.dontcare(slot).search(x.transcription):
                 return len(self.ontology[slot])
             if self.decline.search(x.transcription):
                 return -1
