@@ -25,8 +25,13 @@ for ex in examples:
     elif q == "q":
         break
     elif len(q) > 0:
-        found_ex = [x for x in examples if x.transcription == q]
-        print(found_ex)
+        found_ex = [x for x in examples if q in x.transcription
+                or q in x.system_transcription]
+        for fex in found_ex[:10]:
+            print(fex.transcription)
+            print(fex.system_transcription)
+            print(fex)
+            input()
         input()
 
 

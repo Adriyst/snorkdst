@@ -34,15 +34,30 @@ class ValueVoter:
                     "moderate , or expensive price range?"
         }
 
+        self.sorry_statement = re.compile("^sorry would you like")
+
         self.confirm_statements = {
             "food": re.compile(
                 r"you are looking for a ([a-z\s]*)\s?restaurant (is that |serving any kind of food )?right?"
             ),
             "area": re.compile(
-                r"did you say you are looking for a restaurant in the (\w+) of town?"
+                r"did you say you are looking for a restaurant in (?:the (\w+)|any part) of town?"
             ),
             "pricerange": re.compile(
                 r"let me confirm , you are looking for a restaurant in the (\w+) price range right?"
+            )
+        }
+
+        self.confirm_dontcare_statements = {
+            "food": re.compile(
+                r"dontmatchanythinghere"
+            ),
+            "area": re.compile(
+                r"ok , a restaurant in any part of town is that right?"
+            ),
+            "pricerange": re.compile(
+                r"let me confirm , you are looking for a restaurant and you dont care"\
+                " about the price range right?"
             )
         }
 
@@ -54,7 +69,7 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.dontcare_vote, #self.woz_label_func, self.dontcare_vote
+                self.dontcare_vote#self.woz_label_func, self.dontcare_vote
         ]
         self.fixing_functions = [
                 self.exclude_slot, self.whatabout_vote, self.invalid_vote
@@ -114,6 +129,8 @@ class ValueVoter:
 
         def dontcare_value(x: pd.Series):
             if self.dontcare(slot).search(x.transcription):
+                if self.sorry_statement.search(x.system_transcription):
+                    return len(self.ontology[slot])
                 search_phrase = slot if slot != "pricerange" else "(pricerange|price range)"
                 if re.search(rf"{search_phrase}", x.system_transcription) or \
                         (x.system_transcription in phrases and\
@@ -279,6 +296,10 @@ class ValueVoter:
                     self.question_not_request(x.transcription):
                         return -1
 
+            if self.confirm_dontcare_statements[slot].match(x.system_transcription):
+                if self.accept.search(x.transcription):
+                    return len(self.ontology[slot])
+
             statement = self.confirm_statements[slot].search(x.system_transcription)
             if not statement or x.transcription in self.invalids:
                 return -1
@@ -304,7 +325,10 @@ class ValueVoter:
                 return other_val
             return -1
         if self.accept.search(x.transcription):
-            vote = self.ontology[slot].index(match)
+            if match in self.ontology:
+                vote = self.ontology[slot].index(match)
+            else:
+                vote = len(self.ontology)
             return vote
         return -1
 
