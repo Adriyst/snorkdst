@@ -69,7 +69,7 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.dontcare_vote#self.woz_label_func, self.dontcare_vote
+                self.woz_label_func, self.dontcare_vote
         ]
         self.fixing_functions = [
                 self.exclude_slot, self.whatabout_vote, self.invalid_vote
