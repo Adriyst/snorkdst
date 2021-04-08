@@ -27,11 +27,10 @@ class SnorkelCenter:
 
         self.func_order = [
                 "val_in_text", "val_in_response", "val_in_request",
-                "woz_label", "dontcare_value"
+                "woz_label", "dontcare_value", "whatabout_vote"
         ]
         base_funcs = self.func_order.copy()
         self.func_order.extend([f"{x}_exclude_func" for x in base_funcs])
-        self.func_order.extend([f"{x}_vote_whatabout" for x in base_funcs])
         self.func_order.extend([f"{x}_vote_invalid" for x in base_funcs])
 
     def get_analyses(self, vote=True, snorkel=True):
@@ -91,18 +90,41 @@ class SnorkelCenter:
         turn_index = 0
         current_dial = ""
         dial = []
-        for _, row in self.dataframe.iterrows():
+        for _, row in tqdm(self.dataframe.iterrows()):
             if row.dial != current_dial:
                 current_dial = row.dial
                 dial = [d for d in dials if d["session-id"] == row.dial][0]
                 turn_index = 0
+            food_cols = [col for col in self.dataframe.columns if "food_lf" in col]
+            area_cols = [col for col in self.dataframe.columns if "area_lf" in col]
+            price_cols = [col for col in self.dataframe.columns if "pricerange_lf" in col]
+
+            food_maj = [col for col in row[food_cols] if col > -1]
+            area_maj = [col for col in row[area_cols] if col > -1]
+            price_maj = [col for col in row[price_cols] if col > -1]
+            chosen_votes = []
+            for slot_votes in [food_maj, area_maj, price_maj]:
+                if len(slot_votes) == 0:
+                    chosen_votes.append(-1)
+                    continue
+                vote_freqdist = FreqDist(slot_votes)
+                votedist = vote_freqdist.most_common(2)
+                if len(votedist) == 1:
+                    chosen_votes.append(votedist[0][0])
+                    continue
+                if len(set([x[1] for x in votedist])) == 1:
+                    # split vote, dont vote
+                    chosen_votes.append(-1)
+                    continue
+                chosen_votes.append(vote_freqdist.max())
+
+            food_vote, area_vote, price_vote = chosen_votes
             for attr_name, attr in zip(["food", "area", "pricerange"],
-                    [row.food, row.area, row.pricerange]):
+                    [food_vote, area_vote, price_vote]):
                 if attr > -1:
                     vote = self.ontology[attr_name][int(attr)] if \
                             int(attr) < len(self.ontology[attr_name]) else "dontcare"
                     attr_name = attr_name if attr_name != "pricerange" else "price range"
-                    print(dial)
                     dial["dialogue"][turn_index]["turn_label"].append([attr_name, vote])
             turn_index += 1
         json.dump(dials, open("dstc2_majority_en.json", "w"))
@@ -118,8 +140,14 @@ class SnorkelCenter:
             matrix.append([self.dataframe.at[row.name, c] for c in relevant_cols])
         
         matrix = np.asarray(matrix)
-        label_model = LabelModel(cardinality = len(self.ontology[slot]) + 101, verbose=True)
-        label_model.fit(L_train=matrix, n_epochs=500, log_freq=100, seed=607)
+        label_model = LabelModel(cardinality = len(self.ontology[slot]) + 102, verbose=True)
+        print("Max value", matrix.max())
+        print("Argmax", matrix.argmax())
+        print("For slot", slot)
+        print("With shape", matrix.shape)
+        print("Cardinality", label_model.cardinality)
+        print("aka", len(self.ontology[slot]) + 101)
+        label_model.fit(L_train=matrix, n_epochs=800, log_freq=100, seed=607)
         res = label_model.predict(matrix)
         for i, pred in enumerate(res):
             if pred > len(self.ontology[slot]):
@@ -136,7 +164,7 @@ class SnorkelCenter:
         turn_index = 0
         current_dial = np.Inf
         dial = []
-        for _, row in self.dataframe.iterrows():
+        for _, row in tqdm(self.dataframe.iterrows()):
             if row.dial != current_dial:
                 current_dial = row.dial
                 dial = [d for d in dials if d["session-id"] == row.dial][0]
@@ -196,7 +224,7 @@ class SnorkelCenter:
         dials_to_fix = {}
         fixer = DialogueFixing(slot)
 
-        for _, row in self.dataframe.iterrows():
+        for _, row in tqdm(self.dataframe.iterrows()):
             for lf in labeling_functions:
                 col_name = f"{slot}_lf_{lf.__name__}"
                 if col_name not in self.dataframe.columns:
@@ -212,7 +240,9 @@ class SnorkelCenter:
             # all previous turns.
 
             all_in_dial = self.dataframe.query(f"dial == '{row.dial}'")
-            if row.dial not in fixer.fixing_results:
+            if row.dial in fixer.fixing_results:
+                continue
+            else:
                 fixer.fixing_results[row.dial] = []
 
             for _, fix_row in all_in_dial.iterrows():
@@ -399,10 +429,16 @@ class DialogueFixing:
 
     def apply(self, dataframe):
         for dialogue, results in self.fixing_results.items():
+            applied_results = [x.position for x in results if x.apply]
             affected_dialogue = dataframe.query(f"dial == '{dialogue}'")
+            final_result = min(applied_results) if any(applied_results) else\
+                min(affected_dialogue.index)
+            min_idx = final_result - min(affected_dialogue.index)
+            affected_dialogue = affected_dialogue[:min_idx]
             if len(affected_dialogue) == 0:
-                print("empty dial?? - ", dialogue)
-                continue
+                for _, turn in affected_dialogue.iterrows():
+                    for funcname in [x for y in results for x in y.affected]:
+                        dataframe.at[turn.name, funcname] = -1
             for res in results:
                 vote = -1
                 for affected_func in res.affected:
@@ -441,6 +477,18 @@ class FormatEntry:
             "perc": "\%",
             "rate": ""
         }
+        self.func_name_table = {
+            "valintext": "VIT",
+            "valinresponse": "VIRS",
+            "valinrequest": "VIRQ",
+            "dontcarevalue": "DCV",
+            "votewhatabout": "VWA",
+            "valintextexcludefunc": "VIT-REJ",
+            "valinresponseexcludefunc": "VIRS-REJ",
+            "valinrequestexcludefunc": "VIRQ-REJ",
+            "dontcarevalueexcludefunc": "DCV-REJ",
+            "votewhataboutexcludefunc": "VWA-REJ"
+        }
 
     def generate_format_string(self):
         s = ""
@@ -449,6 +497,7 @@ class FormatEntry:
             if column == "name":
                 removed_first_part = re.sub(r"\w+_lf_", "", self.row.name)
                 num = removed_first_part.replace("_", "")
+                num = self.func_name_table[num]
             elif isinstance(column, str):
                 num = self.operation_map[op](self.row[column])
             elif isinstance(column, tuple):

@@ -3,12 +3,9 @@ from snorkel_center import SnorkelCenter, Analyzer, LatexFormatter
 sc = SnorkelCenter()
 sc._vote_to_frame(sc.vote_to_frame)
 ana = Analyzer(sc.dataframe)
-for slot in ("food", "area", "pricerange"):
+#for slot in ("food", "area", "pricerange"):
+analyses = {"food": None, "area": None, "pricerange": None}
+for slot in ("food",):
     overview = ana.analyze(slot)
-    new_df = ana.structure_analysis(overview)
-    formatter = LatexFormatter(new_df)
-    formatted_table = formatter.format()
-    slotname = slot if slot != "pricerange" else "price"
-    with open(f"appendix_{slotname}_table_model.txt", "w") as f:
-        f.writelines([f"{x}\n" for x in formatted_table])
+    analyses[slot] = overview
 

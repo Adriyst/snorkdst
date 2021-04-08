@@ -1,4 +1,5 @@
 from snorkel.labeling import labeling_function
+from nltk import FreqDist
 import numpy as np
 import pandas as pd
 import regex as re
@@ -25,6 +26,11 @@ class ValueVoter:
         self.ontology = center.ontology if center else\
                 get_data.DataFetcher.fetch_dstc_ontology()["informable"]
         self.alternatives = bertbst_model.SEMANTIC_DICT
+
+
+        self.welcome_msg = "hello , welcome to the cambridge restaurant system? "\
+        "you can ask for restaurants "\
+        "by area , price range or food type . how may i help you?"
         
         # request wording for each slot
         self.request_statements = {
@@ -69,16 +75,17 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.woz_label_func, self.dontcare_vote
+                self.dontcare_vote, self.whatabout_vote, self.any_x
         ]
         self.fixing_functions = [
-                self.exclude_slot, self.whatabout_vote, self.invalid_vote
+                self.exclude_slot
         ]
 
         self.decline = re.compile(r"(^|\s)(now?|wrong)($|\s)")
         self.accept = re.compile(r"(^|\s)(right|yea?|correct|yes|yeah)($|\s)")
-        self.dontcare = lambda slot: re.compile(rf"(^any( ({slot}|kind))?|dont care|do not "\
-                "care|dontcare|care|(it )?doesnt matter|none|dont know|anything|what ?ever)")
+        self.dontcare = lambda slot: re.compile(rf"(^any(?!thing)( ({slot}|kind|type))?|dont care|do not "\
+                "care|dontcare|care|(it )?(doesnt|dont) matter|none|dont know|"\
+                "anything(?! else)|what ?ever)")
 
         self.suggest_option = re.compile(
                 r"^(?:(?:\w+\s?){1,6}) is a (?:nice|great) restaurant"\
@@ -90,14 +97,26 @@ class ValueVoter:
         self.exceptions = self.slot_exceptions()
         self.woz_train_votes = self.get_woz_votes("train")
 
+    def any_x(self, slot):
+
+        def dontcare_x(x: pd.Series):
+            slot_x = {
+                    "food": "(food)",
+                    "area": "(area|part)",
+                    "pricerange": "(price|price range|pricerange)"
+            }[slot]
+            return len(self.ontology[slot]) if re.search(f"any {slot_x}", x.transcription) else -1
+
+        return dontcare_x
+
     def invalid_vote(self, slot):
         
         def vote_invalid(x: pd.Series):
             affected_funcs = [fn.__name__ for fn in
                     self.get_labeling_functions_for_slot(slot)]
 
-            return_T = FixingReturn(True, False, affected_funcs, vote_invalid)
-            return_F = FixingReturn(False, False, [], vote_invalid)
+            return_T = FixingReturn(True, False, affected_funcs, vote_invalid, x.name)
+            return_F = FixingReturn(False, False, [], vote_invalid, x.name)
 
             return return_T if x.transcription in self.invalids else return_F
            
@@ -106,18 +125,15 @@ class ValueVoter:
     def whatabout_vote(self, slot):
 
         def vote_whatabout(x: pd.Series):
-            affected_funcs = [fn.__name__ for fn in 
-                    self.get_labeling_functions_for_slot(slot)]
 
-            return_T = FixingReturn(True, True, affected_funcs, vote_whatabout) 
-            return_F = FixingReturn(False, True, [], vote_whatabout)
-            
-            to_match = slot if slot != "pricerange" else "(pricerange|price range)"
-            if not re.search(fr"{to_match}", x.system_transcription):
-                return return_F
-            if not re.search(fr"(what|how) about", x.transcription):
-                return return_F
-            return return_T
+            whatabout_regexp = re.search(
+                    r"((what|how) about|is it) \w+",
+                    x.transcription
+            )
+            if not whatabout_regexp:
+                return -1
+
+            return self.vote_for_slot(slot)(x)
 
         return vote_whatabout
 
@@ -128,14 +144,26 @@ class ValueVoter:
         }
 
         def dontcare_value(x: pd.Series):
+            dc_vote = len(self.ontology[slot])
+            if self.vote_for_slot(slot)(x) > -1:
+                return -1
             if self.dontcare(slot).search(x.transcription):
+                if x.system_transcription == self.welcome_msg:
+                    return dc_vote
                 if self.sorry_statement.search(x.system_transcription):
-                    return len(self.ontology[slot])
+                    if {
+                        "food":"food",
+                        "area":"of town",
+                        "pricerange": "price range"
+                    }[slot] in x.transcription:
+                        return dc_vote
+                    else:
+                        return -1
                 search_phrase = slot if slot != "pricerange" else "(pricerange|price range)"
                 if re.search(rf"{search_phrase}", x.system_transcription) or \
                         (x.system_transcription in phrases and\
                         phrases[x.system_transcription] == slot):
-                    return len(self.ontology[slot])
+                    return dc_vote
             
             return -1
 
@@ -167,6 +195,7 @@ class ValueVoter:
                     self.vote_for_slot(slot).__name__,
                     self.response_vote(slot).__name__,
                     self.confirmation_vote(slot).__name__,
+                    self.whatabout_vote(slot).__name__,
                     self.woz_label_func(slot).__name__
             ]
             affected_funcs = [fn.__name__ for fn in 
@@ -174,8 +203,8 @@ class ValueVoter:
                     if fn.__name__ in aff_func_names]
 
             
-            return_T = FixingReturn(True, False, affected_funcs, exclude_func)
-            return_F = FixingReturn(False, False, [], exclude_func)
+            return_T = FixingReturn(True, False, affected_funcs, exclude_func, x.name)
+            return_F = FixingReturn(False, False, [], exclude_func, x.name)
 
             if not (match := self.suggest_option.match(x.system_transcription)):
                 return return_F
@@ -245,9 +274,8 @@ class ValueVoter:
     def vote_for_slot(self, slot):
 
         def val_in_text(x: pd.Series):
-            if x.transcription in self.invalids or \
-                    self.question_not_request(x.transcription):
-                        return -1
+            if x.transcription in self.invalids:
+                return -1
 
             words = x.transcription.split()
             for word_idx, word in enumerate(words):
@@ -266,7 +294,6 @@ class ValueVoter:
                             vote = self.ontology[slot].index(val)
                             return vote 
 
-            
             return -1
 
         return val_in_text
@@ -309,7 +336,6 @@ class ValueVoter:
                     if self.accept.search(x.transcription):
                         vote = len(self.ontology[slot])
                         return vote
-                    
                     return self.accept_or_decline_val(x, slot, "")
             match = match_groups[0].strip()
             if len(match) == 0:
@@ -325,10 +351,11 @@ class ValueVoter:
                 return other_val
             return -1
         if self.accept.search(x.transcription):
-            if match in self.ontology:
+            if match in self.ontology[slot]:
                 vote = self.ontology[slot].index(match)
             else:
-                vote = len(self.ontology)
+                vote = len(self.ontology[slot])
+
             return vote
         return -1
 
@@ -420,9 +447,86 @@ class FixingReturn:
      - affected ([fn]): List of voting function that it should correlate with
     """
 
-    def __init__(self, apply, mode, affected, ff):
+    def __init__(self, apply, mode, affected, ff, position):
         self.apply = apply
         self.positive = mode
         self.affected = affected
         self.ff = ff
+        self.position = position
+
+
+
+class SystemStateParser:
+
+    RESTAURANT_STATES = "./restaurantstate.json"
+    FIND_RES_NAME = re.compile(r"((?:\w+\s*)+) is a")
+    SLOTS = ["food", "area", "pricerange"]
+
+    def __init__(self, df: pd.DataFrame, val_voter: ValueVoter):
+        self.df = df
+        self.val_voter = val_voter
+        self.restaurant_states = json.load(open(self.RESTAURANT_STATES))
+        self.system_states = self._split_to_sections()
+
+    def _find_restaurant(self, start=0):
+        for turn_idx, turn in self.df.iloc[start:].iterrows():
+            if not (hit := self.FIND_RES_NAME.search(turn.system_transcription)):
+                continue
+            if (rest := hit.groups()[0]) not in self.val_voter.ontology["name"]:
+                print("COULD NOT FIND RESTAURANT %s" % rest)
+                continue
+            return turn_idx, self.restaurant_states[rest]
+        return None, None
+
+    def _get_next_start_idx(self, idx):
+        return len(self.df) - (max(self.df.index) - idx)
+
+    def _split_to_sections(self):
+        first_idx, first_state = self._find_restaurant()
+        if not first_idx:
+            return {}
+        states = {first_idx: first_state}
+        start_idx = self._get_next_start_idx(first_idx)
+        next_idx, next_state = self._find_restaurant(start=start_idx)
+        while next_idx is not None:
+            states[next_idx] = next_state
+            start_idx = self._get_next_start_idx(next_idx)
+            next_idx, next_state = self._find_restaurant(start=start_idx)
+        return states
+
+    def find_approx_state(self):
+        for state_idx, state in self.system_states.items():
+            approx = self._form_approx_state(state_idx - 1)
+            for k,v in approx.items():
+                if state[k] != v:
+                    right_idx = self._get_next_start_idx(state_idx)
+                    print(self.df.iloc[0].dial)
+                    for _, turn in self.df.iloc[:right_idx].iterrows():
+                        print(turn.transcription)
+                        print(turn.system_transcription)
+                        print()
+                    print(state)
+                    print(approx)
+                    input()
+                    
+
+
+    def _form_approx_state(self, idx):
+        end_idx = self._get_next_start_idx(idx)
+        approx = {}
+        for turn_idx, turn in self.df.iloc[:end_idx].iterrows():
+            for slot in self.SLOTS:
+                rel_cols = [col for col in self.df.columns if f"{slot}_lf" in col]
+                vote_cols = [col for col in rel_cols if turn[col] > -1]
+                if not any(vote_cols):
+                    continue
+                vote_max = FreqDist(turn[vote_cols]).max()
+                if vote_max >= len(self.val_voter.ontology[slot]):
+                    continue
+                ont_item = self.val_voter.ontology[slot][vote_max]
+                approx[slot] = ont_item
+        return approx
+
+
+
 
