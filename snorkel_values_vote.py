@@ -10,11 +10,7 @@ import bertbst_model
 
 from pylev import levenshtein as distance
 
-VOTE = {
-    "VOTE": 1,
-    "ABSTAIN": -1,
-    "NEGATIVE": 0
-}
+ASR_THRESHOLD = .15
 
 class ValueVoter:
 
@@ -110,8 +106,11 @@ class ValueVoter:
         if real:
             return -1
         for asr in x.asr[1:]:
+            transc, score = asr
+            if score < ASR_THRESHOLD:
+                return -1
             xcop = x.copy()
-            xcop.transcription = asr[0]
+            xcop.transcription = transc
             if (asr_try := func(xcop, **kwargs)) > -1:
                 return asr_try
         return -1
@@ -340,7 +339,7 @@ class ValueVoter:
                     possibilities.append(" ".join(attempt))
         return possibilities
 
-    def vote_for_slot(self, slot, threshold=.15):
+    def vote_for_slot(self, slot, threshold=ASR_THRESHOLD):
 
         def val_in_text(x: pd.Series, real=False):
 
@@ -568,14 +567,103 @@ class ValueVoter:
 
 class SnorkelDialogueVoter:
 
+    threshold = ASR_THRESHOLD
+
     def __init__(self, center):
         self.center = center
         self.functions = [
-            self.find_missing_val
+            self.find_missing_val, self.keyword_found_no_val
         ]
 
+        self.price_functions = [
+            self.budget_hit
+        ]
+        self.function_map = {
+            "food": [],
+            "area": [],
+            "pricerange": self.price_functions
+        }
+
     def get_functions(self, slot):
-        return [fn(slot) for fn in self.functions]
+        funcs = [fn(slot) for fn in self.functions]
+        funcs.extend(self.function_map[slot])
+        return funcs
+    
+    def budget_hit(self, x: pd.Series, real=False):
+        if real:
+            return -1
+        slot = "pricerange"
+
+        curr_preds = self.resolve(x, slot)
+
+        def find_keyword(transc):
+            if "budget" not in transc:
+                return []
+            
+            dial_df = self.center.dataframe.query(f"dial == '{x.dial}'")
+            row_idx = x.name - min(dial_df.index)
+            candidates = []
+            for turn_idx, turn in dial_df.iloc[row_idx+1:].iterrows():
+                if len(candidates) > 0:
+                    break
+                if len((pred := self.resolve(turn, slot))) > 0:
+                    majority = self.get_majority_from_candidates(pred, slot)
+                    if len(majority) > 0:
+                        candidates.append((turn_idx, majority[1]))
+
+            return candidates
+
+        for asr in x.asr:
+            transc, score = asr
+            if score < self.threshold:
+                break
+            if len(cand := find_keyword(transc)) > -1:
+                return cand
+        return []
+
+
+    def keyword_found_no_val(self, slot, real=False):
+
+        def keyword_found(x: pd.Series, real=False):
+            found = {
+                "food": re.compile(r"(serving \w+| \w+ food)"),
+                "area": re.compile(r"(\w+ of town|\w+ area)"),
+                "pricerange": re.compile(r"(in the )?\w+ price ?range")
+                }[slot]
+
+            curr_preds = self.resolve(x, slot)
+            if len(curr_preds) > 0:
+                return []
+
+            def check_for_transc(transc):
+                if not found.search(transc):
+                    return []
+                # find first occuring slot value for slot
+                dial_df = self.center.dataframe.query(f"dial == '{x.dial}'")
+                row_idx = x.name - min(dial_df.index)
+                candidates = []
+                for turn_idx, turn in dial_df.iloc[row_idx+1:].iterrows():
+                    if len(candidates) > 0:
+                        break
+                    if len((pred := self.resolve(turn, slot))) > 0:
+                        majority = self.get_majority_from_candidates(pred, slot)
+                        if len(majority) > 0:
+                            candidates.append((turn_idx, majority[1]))
+                return candidates
+
+            if real:
+                return check_for_transc(x.real_transcription)
+
+            for asr in x.asr:
+                transc, score = asr
+                if score < self.threshold:
+                    break
+                if len(cand := check_for_transc(transc)) > 0:
+                    return cand
+
+            return []
+
+        return keyword_found
     
     def find_missing_val(self, slot):
         
@@ -587,16 +675,17 @@ class SnorkelDialogueVoter:
                 return []
 
             row_idx = x.name - min(dial_df.index)
-            rel_cols = [col for col in dial_df.columns if f"{slot}_lf_" in col]
-            any_vote = [(rc, x[rc]) for rc in rel_cols if x[rc] > -1]
+            any_vote = self.resolve(x, slot)
             if len(any_vote) == 0  or (len(any_vote) > 1 and 
                     len(set([r[1] for r in any_vote])) > 1):
+                return []
+            if any_vote[0][1] == len(self.center.value_voter.ontology[slot]):
                 return []
 
             returns = []
             for _, row in dial_df.iloc[:row_idx].iterrows():
                 candidates = FreqDist()
-                any_cast = [row[rc] for rc in rel_cols if row[rc] > -1]
+                any_cast = self.resolve(row, slot)
                 if len(any_cast) > 0:
                     # dont cast vote if another value has been cast
                     return []
@@ -613,6 +702,33 @@ class SnorkelDialogueVoter:
             return returns
 
         return find_example 
+
+    def resolve(self, x: pd.Series, slot: str):
+        """
+        For a turn, find out if it has any votes for a given slot
+        """
+        rel_cols = [col for col in self.center.dataframe if f"{slot}_lf" in col]
+        return [(col, x[col]) for col in rel_cols if x[col] > -1]
+    
+    def get_majority_from_candidates(self, cands, slot):
+        """
+        cands should be of the form [(column_name, prediction_value)].
+
+        returns:
+            top (column_name, prediction_value) by count
+        """
+        if len(cands) == 1:
+            return cands[0]
+        two_most_com = sorted(cands, reverse=True, key=lambda x: x[1])
+        vals = list(set([x[1] for x in two_most_com]))
+        if len(vals) == 1:
+            return two_most_com[0]
+        elif vals[0] > vals[1]:
+            return two_most_com[0]
+        elif vals[0] > len(self.center.value_voter.ontology[slot]) or \
+                vals[1] > len(self.center.value_voter.ontology[slot]):
+            return []
+        return two_most_com[0]
 
 
 

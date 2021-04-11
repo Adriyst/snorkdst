@@ -142,7 +142,7 @@ class SnorkelCenter:
 
     def majority_vote(self):
         dials = self._file_format()
-        self._vote_to_frame(self.vote_to_frame)
+        self.cast_votes()
         turn_index = 0
         current_dial = ""
         dial = []
