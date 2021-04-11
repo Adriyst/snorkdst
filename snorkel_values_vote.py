@@ -26,6 +26,7 @@ class ValueVoter:
         self.ontology = center.ontology if center else\
                 get_data.DataFetcher.fetch_dstc_ontology()["informable"]
         self.alternatives = bertbst_model.SEMANTIC_DICT
+        self.center = center
 
 
         self.welcome_msg = "hello , welcome to the cambridge restaurant system? "\
@@ -75,16 +76,16 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.dontcare_vote, self.whatabout_vote, self.any_x
+                self.dontcare_vote, self.whatabout_vote, self.any_x, self.slot_support
         ]
         self.fixing_functions = [
-                self.exclude_slot
+                #self.exclude_slot
         ]
 
         self.decline = re.compile(r"(^|\s)(now?|wrong)($|\s)")
         self.accept = re.compile(r"(^|\s)(right|yea?|correct|yes|yeah)($|\s)")
         self.dontcare = lambda slot: re.compile(rf"(^any(?!thing)( ({slot}|kind|type))?|dont care|do not "\
-                "care|dontcare|care|(it )?(doesnt|dont) matter|none|dont know|"\
+                "care|dontcare|care|(it )?(doesn'?t|dont) matter|none|dont know|"\
                 "anything(?! else)|what ?ever)")
 
         self.suggest_option = re.compile(
@@ -97,15 +98,74 @@ class ValueVoter:
         self.exceptions = self.slot_exceptions()
         self.woz_train_votes = self.get_woz_votes("train")
 
+        self.support_regexes = {
+            "food": re.compile(r"serving ((?:\w+\s?){1,2}) food"),
+            "area": re.compile(r"(?:in )?(\w+) (?:of town|part)"),
+            "pricerange": re.compile(r"(?:(\w+) restaurant|in (the)? (\w+) "
+                "(?:price|pricerange|price range))")
+        }
+
+
+    def check_asr(self, x, func, real=False, **kwargs):
+        if real:
+            return -1
+        for asr in x.asr[1:]:
+            xcop = x.copy()
+            xcop.transcription = asr[0]
+            if (asr_try := func(xcop, **kwargs)) > -1:
+                return asr_try
+        return -1
+
+    def slot_support(self, slot):
+
+        def support_val(x: pd.Series, real=False):
+            transc = x.transcription if not real else x.real_transcription
+            if not (match := self.support_regexes[slot].search(transc)):
+                return -1
+
+            if (hit := match.groups()[0]) not in self.ontology[slot]:
+                if not isinstance(hit, str):
+                    return -1
+                if self.dontcare(slot).match(hit):
+                    return len(self.ontology[slot])
+                return -1
+
+            words = transc.split()
+            for word_idx, word in enumerate(words):
+                if word in self.ontology[slot]:
+                    if word in self.exceptions[slot] and\
+                            word_idx < len(words) - 1 and\
+                            words[word_idx+1] in self.exceptions[slot][word]:
+                            continue
+                    vote = self.ontology[slot].index(word)
+                    return vote
+                for candidate in [
+                        word, *self.find_double_word_value(word, transc, slot)
+                ]:
+                    for val, alt_vals in self.alternatives.items():
+                        if val in self.ontology[slot] and candidate in alt_vals:
+                            vote = self.ontology[slot].index(val)
+                            return vote 
+
+            return -1
+
+        return support_val
+
     def any_x(self, slot):
 
-        def dontcare_x(x: pd.Series):
+        def dontcare_x(x: pd.Series, real=False, cont=True):
+            transc = x.transcription if not real else x.real_transcription
             slot_x = {
-                    "food": "(food)",
-                    "area": "(area|part)",
-                    "pricerange": "(price|price range|pricerange)"
+                    "food": r"any (food)",
+                    "area": r"any (area|part)",
+                    "pricerange": r"any (price|price range|pricerange)"
             }[slot]
-            return len(self.ontology[slot]) if re.search(f"any {slot_x}", x.transcription) else -1
+            if not re.search(slot_x, transc):
+                if not cont:
+                    return -1
+
+                return self.check_asr(x, dontcare_x, real=real, cont=False)
+            return len(self.ontology[slot])
 
         return dontcare_x
 
@@ -124,16 +184,21 @@ class ValueVoter:
 
     def whatabout_vote(self, slot):
 
-        def vote_whatabout(x: pd.Series):
+        def vote_whatabout(x: pd.Series, real=False, cont=True):
+            transc = x.transcription if not real else x.real_transcription
 
             whatabout_regexp = re.search(
                     r"((what|how) about|is it) \w+",
-                    x.transcription
+                    transc
             )
             if not whatabout_regexp:
-                return -1
+                if not cont: 
+                    return -1
 
-            return self.vote_for_slot(slot)(x)
+                return self.check_asr(x, vote_whatabout, real=real, cont=False)
+
+
+            return self.vote_for_slot(slot)(x, real=real)
 
         return vote_whatabout
 
@@ -143,11 +208,12 @@ class ValueVoter:
             "what part of town do you have in mind?": "area"
         }
 
-        def dontcare_value(x: pd.Series):
+        def dontcare_value(x: pd.Series, real=False, cont=True):
+            transc = x.transcription if not real else x.real_transcription
             dc_vote = len(self.ontology[slot])
-            if self.vote_for_slot(slot)(x) > -1:
+            if self.vote_for_slot(slot)(x, real=real) > -1:
                 return -1
-            if self.dontcare(slot).search(x.transcription):
+            if self.dontcare(slot).search(transc):
                 if x.system_transcription == self.welcome_msg:
                     return dc_vote
                 if self.sorry_statement.search(x.system_transcription):
@@ -155,7 +221,7 @@ class ValueVoter:
                         "food":"food",
                         "area":"of town",
                         "pricerange": "price range"
-                    }[slot] in x.transcription:
+                    }[slot] in transc:
                         return dc_vote
                     else:
                         return -1
@@ -165,7 +231,10 @@ class ValueVoter:
                         phrases[x.system_transcription] == slot):
                     return dc_vote
             
-            return -1
+            if not cont:
+                return -1
+
+            return self.check_asr(x, dontcare_value, real=real, cont=False)
 
         return dontcare_value
 
@@ -189,7 +258,7 @@ class ValueVoter:
 
     def exclude_slot(self, slot: str):
 
-        def exclude_func(x):
+        def exclude_func(x, real=False):
 
             aff_func_names = [
                     self.vote_for_slot(slot).__name__,
@@ -234,7 +303,7 @@ class ValueVoter:
 
             if slot in x.transcription or \
                     (slot == "pricerange" and "price range" in x.transcription):
-                        if self.vote_for_slot(slot)(x) >= 0:
+                        if self.vote_for_slot(slot)(x, real=real) >= 0:
                             # a value was stated in the slot, no need to interfere
                             return return_F 
                         # a value was specifically requested, return negative
@@ -271,86 +340,145 @@ class ValueVoter:
                     possibilities.append(" ".join(attempt))
         return possibilities
 
-    def vote_for_slot(self, slot):
+    def vote_for_slot(self, slot, threshold=.15):
 
-        def val_in_text(x: pd.Series):
-            if x.transcription in self.invalids:
+        def val_in_text(x: pd.Series, real=False):
+
+            def resolve(transc):
+                if transc in self.invalids:
+                    return -1
+
+                words = transc.split()
+                for word_idx, word in enumerate(words):
+                    if word in self.ontology[slot]:
+                        if word in self.exceptions[slot] and\
+                                word_idx < len(words) - 1 and\
+                                words[word_idx+1] in self.exceptions[slot][word]:
+                                continue
+                        vote = self.ontology[slot].index(word)
+                        return vote
+                    for candidate in [
+                            word, *self.find_double_word_value(word, transc, slot)
+                    ]:
+                        for val, alt_vals in self.alternatives.items():
+                            if val in self.ontology[slot] and candidate in alt_vals:
+                                vote = self.ontology[slot].index(val)
+                                return vote 
+
                 return -1
 
-            words = x.transcription.split()
-            for word_idx, word in enumerate(words):
-                if word in self.ontology[slot]:
-                    if word in self.exceptions[slot] and\
-                            word_idx < len(words) - 1 and\
-                            words[word_idx+1] in self.exceptions[slot][word]:
-                            continue
-                    vote = self.ontology[slot].index(word)
-                    return vote
-                for candidate in [
-                        word, *self.find_double_word_value(word, x.transcription, slot)
-                ]:
-                    for val, alt_vals in self.alternatives.items():
-                        if val in self.ontology[slot] and candidate in alt_vals:
-                            vote = self.ontology[slot].index(val)
-                            return vote 
+            if real:
+                return resolve(x.real_transcription)
 
-            return -1
+            candidates = {}
+            for asr in x.asr:
+                transc, score = asr
+                if score < threshold:
+                    break
+                result = resolve(transc)
+                if (result := resolve(transc)) > -1:
+                    if result not in candidates:
+                        candidates[result] = 0
+                    candidates[result] += score
+
+            if len(candidates) == 0:
+                return -1
+            ordered = list(sorted(candidates.keys(), reverse=True,
+                key=lambda x: candidates[x]))
+            return ordered[0]
+            
+
 
         return val_in_text
 
     def response_vote(self, slot):
 
-        def val_in_response(x: pd.Series):
-            if x.transcription in self.invalids or \
-                    self.question_not_request(x.transcription):
+        def val_in_response(x: pd.Series, real=False):
+
+            def try_asr():
+                if real:
+                    return -1
+                for asr in x.asr[1:5]:
+                    xcop = x.copy()
+                    xcop.transcription = asr[0]
+                    if (asr_try := self.vote_for_slot(slot)(xcop)) > -1:
+                        return asr_try
+                return -1
+
+            transc = x.transcription if not real else x.real_transcription
+            if transc in self.invalids or \
+                    self.question_not_request(transc):
                         return -1
             if x.system_transcription != self.request_statements[slot]:
                 return -1
-            if self.dontcare(slot).search(x.transcription):
+            if self.dontcare(slot).search(transc):
                 return len(self.ontology[slot])
-            if self.decline.search(x.transcription):
+            if self.decline.search(transc):
                 return -1
-            if (attempt := self.vote_for_slot(slot)(x)) > 0:
+            if (attempt := self.vote_for_slot(slot)(x, real=real)) > 0:
                 return attempt
-            return -1
+            return try_asr()
 
         return val_in_response
 
     def confirmation_vote(self, slot):
 
-        def val_in_request(x: pd.Series):
-            if x.transcription in self.invalids or \
-                    self.question_not_request(x.transcription):
+        def val_in_request(x: pd.Series, real=False, cont=True):
+            transc = x.transcription if not real else x.real_transcription
+            if transc in self.invalids or \
+                    self.question_not_request(transc):
                         return -1
 
             if self.confirm_dontcare_statements[slot].match(x.system_transcription):
-                if self.accept.search(x.transcription):
+                if self.accept.search(transc):
                     return len(self.ontology[slot])
 
             statement = self.confirm_statements[slot].search(x.system_transcription)
-            if not statement or x.transcription in self.invalids:
+            if not statement or transc in self.invalids:
                 return -1
             match_groups = statement.groups()
             if match_groups[-1] is not None:
                 if match_groups[-1].strip() == "serving any kind of food":
-                    if self.accept.search(x.transcription):
+                    if self.accept.search(transc):
                         vote = len(self.ontology[slot])
                         return vote
                     return self.accept_or_decline_val(x, slot, "")
             match = match_groups[0].strip()
             if len(match) == 0:
+                if real or not cont:
+                    return -1
+
+                for asr in x.asr:
+                    xcop = x.copy()
+                    xcop.transcription = asr[0]
+                    new_attempt = val_in_request(xcop, cont=False)
+                    if new_attempt > -1:
+                        return new_attempt
                 return -1
+
+            if real or not cont:
+                return self.accept_or_decline_val(x, slot, match)
+
+
+            for asr in x.asr:
+                xcop = x.copy()
+                xcop.transcription = asr[0]
+                new_attempt = val_in_request(xcop, cont=False)
+                if new_attempt > -1:
+                    return new_attempt
+
             return self.accept_or_decline_val(x, slot, match)
             
 
         return val_in_request
 
-    def accept_or_decline_val(self, x, slot, match):
-        if self.decline.search(x.transcription):
-            if (other_val := self.vote_for_slot(slot)(x)) > 0 and other_val != match:
+    def accept_or_decline_val(self, x, slot, match, real=False):
+        transc = x.transcription if not real else x.real_transcription
+        if self.decline.search(transc):
+            if (other_val := self.vote_for_slot(slot)(x, real=real)) > 0 and other_val != match:
                 return other_val
             return -1
-        if self.accept.search(x.transcription):
+        if self.accept.search(transc):
             if match in self.ontology[slot]:
                 vote = self.ontology[slot].index(match)
             else:
@@ -400,7 +528,7 @@ class ValueVoter:
 
     def get_exclusion_for_dial(self, slot, frame):
         return any([
-            self.exclude_slot(slot, row) for _, row in frame.iterrows()
+            self.exclude_slot(slot)(row) for _, row in frame.iterrows()
         ])
 
     def get_woz_votes(self, mode):
@@ -436,6 +564,92 @@ class ValueVoter:
                 if not added:
                     votes[slotname].append(-1)
         return votes
+
+
+class SnorkelDialogueVoter:
+
+    def __init__(self, center):
+        self.center = center
+        self.functions = [
+            self.find_missing_val
+        ]
+
+    def get_functions(self, slot):
+        return [fn(slot) for fn in self.functions]
+    
+    def find_missing_val(self, slot):
+        
+        def find_example(x: pd.Series, real=False):
+            if real:
+                return []
+            dial_df = self.center.dataframe.query(f"dial == '{x.dial}'")
+            if x.name == min(dial_df.index):
+                return []
+
+            row_idx = x.name - min(dial_df.index)
+            rel_cols = [col for col in dial_df.columns if f"{slot}_lf_" in col]
+            any_vote = [(rc, x[rc]) for rc in rel_cols if x[rc] > -1]
+            if len(any_vote) == 0  or (len(any_vote) > 1 and 
+                    len(set([r[1] for r in any_vote])) > 1):
+                return []
+
+            returns = []
+            for _, row in dial_df.iloc[:row_idx].iterrows():
+                candidates = FreqDist()
+                any_cast = [row[rc] for rc in rel_cols if row[rc] > -1]
+                if len(any_cast) > 0:
+                    # dont cast vote if another value has been cast
+                    return []
+                for asr in x.asr[1:]:
+                    for w in asr[0].split():
+                        if len(w) < 4:
+                            continue
+                        if w in row.transcription:
+                            candidates[w] += 1
+                if len(candidates) == 0:
+                    continue
+                returns.append((row.name, any_vote[0][1]))
+
+            return returns
+
+        return find_example 
+
+
+
+class SnorkelFixingVoter:
+
+    def __init__(self, center):
+        self.center = center
+        self.fixing_functions = [
+                self.vote_no_last
+        ]
+
+    def get_functions(self, slot):
+        return [fn(slot) for fn in self.fixing_functions]
+
+    def vote_no_last(self, slot):
+        """
+        Will vote against any votes cast in the final turn. Returns a list of tuples of
+        type (COL_TO_VOTE_AGAINST, VOTE_VALUE)
+        """
+
+        def last_vote_no(x: pd.Series, real=False):
+            if real:
+                return -1
+            dial_df = self.center.dataframe.query(f"dial == '{x.dial}'")
+            if x.name == max(dial_df.index):
+                rel_cols = [col for col in dial_df.columns if f"{slot}_lf_" in col
+                        and "last_vote_no" not in col]
+                for col in rel_cols:
+                    if x[col] > -1:
+                        return (col, x[col] + 100)
+            return -1
+
+        return last_vote_no
+
+
+
+
 
 class FixingReturn:
     """

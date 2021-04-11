@@ -36,14 +36,18 @@ class NormalCorpusJson:
                 "dial": dialogue.id,
                 "transcription": "",
                 "system_transcription": "",
+                "real_transcription": "",
+                "asr": [],
                 "food": -1,
                 "area": -1,
                 "pricerange": -1
             }
             for turn in dialogue.turns:
                 turn_obj = dial_obj.copy()
-                turn_obj["transcription"] = turn.transcription
+                turn_obj["transcription"] = turn.asr[0][0]
                 turn_obj["system_transcription"] = turn.system_utterance
+                turn_obj["real_transcription"] = turn.transcription
+                turn_obj["asr"] = turn.asr
                 full_data.append(turn_obj)
         return pd.DataFrame(full_data)
 
@@ -527,6 +531,7 @@ class NormalFormatJson:
         self.requested_slots = []
         self.confirmed_slots = []
         self.goal_labels = {}
+        self.asr = []
 
         self.parse_labels = parse_labels
 
@@ -540,6 +545,7 @@ class NormalFormatJson:
 
     def _clean_dstc(self, dstc_dict):
         self.turn_no = dstc_dict["turn_idx"]
+        self.asr = dstc_dict["asr"]
         self.transcription = dstc_dict["transcript"]
         self.goal_labels = {"food": "none", "area": "none", "pricerange": "none"}
         if self.parse_labels:

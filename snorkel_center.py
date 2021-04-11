@@ -24,6 +24,8 @@ class SnorkelCenter:
                 get_data.DataFetcher.fetch_clean_dstc("train")
         self.dataframe = self.data.to_pandas()
         self.value_voter = snorkel_values_vote.ValueVoter(self)
+        self.fixing_voter = snorkel_values_vote.SnorkelFixingVoter(self)
+        self.dialogue_voter = snorkel_values_vote.SnorkelDialogueVoter(self)
 
         self.func_order = [
                 "val_in_text", "val_in_response", "val_in_request",
@@ -32,6 +34,60 @@ class SnorkelCenter:
         base_funcs = self.func_order.copy()
         self.func_order.extend([f"{x}_exclude_func" for x in base_funcs])
         self.func_order.extend([f"{x}_vote_invalid" for x in base_funcs])
+
+        self.slots = ("food", "area", "pricerange")
+
+    def cast_votes(self, **kwargs):
+        for slot in tqdm(self.slots):
+            labfuncs = self.value_voter.get_labeling_functions_for_slot(slot)
+            fixvotes = self.fixing_voter.get_functions(slot)
+            dialvotes = self.dialogue_voter.get_functions(slot)
+
+            # First: cast utter votes
+
+            for row_idx, row in tqdm(self.dataframe.iterrows()):
+                for lf in labfuncs:
+                    lfname = f"{slot}_lf_{lf.__name__}"
+                    self.dataframe.at[row_idx, lfname] = lf(row, **kwargs)
+
+            # Second: cast dial votes
+
+            # need to instantite column name before iterating
+            for lf in dialvotes:
+                lfname = f"{slot}_lf_{lf.__name__}"
+                if lfname not in self.dataframe.columns:
+                    self.dataframe[lfname] = -1
+
+
+            for row_idx, row in tqdm(self.dataframe.iterrows()):
+                for lf in dialvotes:
+                    lfname = f"{slot}_lf_{lf.__name__}"
+                    res_tup = lf(row, **kwargs)
+                    if len(res_tup) > 0:
+                        for tup in res_tup:
+                            rownum, val = tup
+                            self.dataframe.at[rownum, lfname] = val
+
+            # Third: cast fixing votes
+
+            for row_idx, row in tqdm(self.dataframe.iterrows()):
+                for lf in fixvotes:
+                    res = lf(row, **kwargs)
+                    if not isinstance(res, tuple):
+                        continue
+
+                    rownam, val = res
+                    realname = rownam.split(f"{slot}_lf_")[1]
+                    lfname = f"{slot}_lf_{realname}_{lf.__name__}"
+                    if lfname not in self.dataframe.columns:
+                        self.dataframe[lfname] = -1
+                    self.dataframe.at[row_idx, lfname] = val
+
+            # Donezo!
+
+
+
+
 
     def get_analyses(self, vote=True, snorkel=True):
         # 1. create matrix
@@ -78,11 +134,11 @@ class SnorkelCenter:
             "session-id": dial.id
         } for dix, dial in enumerate(self.data.dialogues)]
 
-    def _vote_to_frame(self, vote_func):
+    def _vote_to_frame(self, vote_func, **kwargs):
         for slot in ["food", "area", "pricerange"]:
             lab_funcs = self.value_voter.get_labeling_functions_for_slot(slot)
             fixing_funcs = self.value_voter.get_fixing_functions_for_slot(slot)
-            vote_func(slot, lab_funcs, fixing_funcs)
+            vote_func(slot, lab_funcs, fixing_funcs, **kwargs)
 
     def majority_vote(self):
         dials = self._file_format()
@@ -214,7 +270,7 @@ class SnorkelCenter:
         return frames, analyses
 
     def vote_to_frame(self, slot, labeling_functions, 
-            fixing_functions):
+            fixing_functions, **kwargs):
         # In order to fit a snorkel model, we need to create an
         # actual matrix. Probably best to add new rows to the frame 
         # originally.
@@ -229,7 +285,7 @@ class SnorkelCenter:
                 col_name = f"{slot}_lf_{lf.__name__}"
                 if col_name not in self.dataframe.columns:
                     self.dataframe[col_name] = -1
-                vote = lf(row)
+                vote = lf(row, **kwargs)
                 self.dataframe.at[row.name, col_name] = vote
 
             # Fixing functions : Their vote depends on the vote of the 
