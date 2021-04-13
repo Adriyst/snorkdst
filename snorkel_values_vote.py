@@ -3,7 +3,9 @@ from nltk import FreqDist
 import numpy as np
 import pandas as pd
 import regex as re
+from sklearn.model_selection import train_test_split
 import json
+from tqdm import tqdm
 
 import get_data
 import bertbst_model
@@ -341,7 +343,7 @@ class ValueVoter:
 
     def vote_for_slot(self, slot, threshold=ASR_THRESHOLD):
 
-        def val_in_text(x: pd.Series, real=False):
+        def val_in_text(x: pd.Series, real=False, only_transc=None):
 
             def resolve(transc):
                 if transc in self.invalids:
@@ -365,6 +367,9 @@ class ValueVoter:
                                 return vote 
 
                 return -1
+
+            if only_transc:
+                return resolve(only_transc)
 
             if real:
                 return resolve(x.real_transcription)
@@ -788,6 +793,71 @@ class FixingReturn:
 
 class SystemStateParser:
 
+    threshold = ASR_THRESHOLD
+
+    def __init__(self, voter: ValueVoter, df: pd.DataFrame):
+        self.vv = voter
+        self.df = df
+        self.states = []
+
+    def _find_slot_and_val(self, w):
+        for k,v in self.vv.ontology.items():
+            if w == v:
+                return k, v
+            for alt, alt_vals in self.vv.alternatives.items():
+                if w in alt_vals:
+                    return k, alt
+        return None
+
+
+    def _apply_expressions(self, transc, system_transc):
+        if self.vv.sorry_statement.search(system_transc) is not None:
+            for w in transc.split():
+                if w in system_transc:
+                    vals_found = self._find_slot_and_val(w)
+                    if vals_found:
+                        return vals_found
+        for slot, regexp in self.vv.confirm_statements.items():
+            if (hit := regexp.search(system_transc)) is not None\
+                    and self.vv.accept(transc):
+                vals_found = self._find_slot_and_val(hit)
+                if vals_found:
+                    return vals_found
+        
+
+        return None
+
+    def _find_next_section(self, dial_df, start=0):
+        state = {}
+        for turn_idx, turn in dial_df.iloc[start:].iterrows():
+            for asr in turn.asr:
+                transc, score = asr
+                if self.threshold > score:
+                    break
+                slotname, slotval = self._apply_expressions(transc,
+                        turn.system_transcription)
+                if slotname:
+                    state[slotname] = slotval
+        
+        return state
+    
+    def find_state(self):
+        dials = self.df.drop_duplicates(subset="dial")
+        for dial_idx, dial_row in dials.iterrows():
+            turns_in_dial = self.df.query(f"dial == '{dial_row}'")
+            first_state = self._find_next_section(turns_in_dial)
+            for turn_idx, turn in turns_in_dial.iterrows():
+                state = self._find_next_section(turn)
+
+        return self._find_next_section()
+
+    def _get_next_start_idx(self, idx):
+        return len(self.df) - (max(self.df.index) - idx)
+
+
+
+class depr_SystemStateParser:
+
     RESTAURANT_STATES = "./restaurantstate.json"
     FIND_RES_NAME = re.compile(r"((?:\w+\s*)+) is a")
     SLOTS = ["food", "area", "pricerange"]
@@ -858,5 +928,100 @@ class SystemStateParser:
         return approx
 
 
+class ParaphrasingTagger:
 
+    threshold = ASR_THRESHOLD
+    random_seed = 607
+    slots = ("food", "area", "pricerange")
+
+    def __init__(self, df: pd.DataFrame, voter: ValueVoter):
+        self.df = df
+        self.vv = voter
+
+    def _get_valid_asrs(self, turn):
+        return [asr[0] for asr in turn.asr if asr[1] > self.threshold]
+
+    def _fetch_first_utterances(self, df):
+        return [self._get_valid_asrs(turn) for _, turn in df.iterrows()]
+
+    def tag_transcs(self, transcriptions: [str]):
+        tags = []
+        for transc in tqdm([asr for tr in transcriptions for asr in tr]):
+            if not transc:
+                continue
+            slotvals = [
+                self.vv.vote_for_slot(slot, threshold=self.threshold)(None,
+                    only_transc=transc)
+                for slot in self.slots
+            ]
+            orig_transc = transc
+            for slotname, slotval in zip(self.slots, slotvals):
+                if slotval == -1 or slotval == len(self.vv.ontology[slotname]):
+                    continue
+                transc = transc.replace(self.vv.ontology[slotname][slotval], 
+                        f"${slotname}")
+            if "$" in transc and len(
+                    [tr for tr in transc.split() if "$" not in tr]
+            ) > 0:
+                tags.append((orig_transc, transc))
+        return list(set(tags))
+
+
+    def parse(self):
+        transcriptions = self._fetch_first_utterances(
+                self.df.drop_duplicates(subset="dial")
+        )
+        return self.tag_transcs(transcriptions)
+
+    def find_bad_examples(self, tagged):
+        only_tagged = [x[1] for x in tagged]
+        for transc in tqdm([
+                asr for tr in self._fetch_first_utterances(
+                    self.df.drop_duplicates(subset="dial")
+                ) for asr in tr
+        ]):
+            spl_transc = transc.split()
+            for tag in only_tagged:
+                if len(spl_tag := tag.split()) != len(spl_transc):
+                    continue
+                hold = True
+                state = {k: "" for k in self.slots}
+                for tag_w, transc_w in zip(spl_tag, spl_transc):
+                    if "$" in tag_w:
+                        only_slot = tag_w.replace("$", "")
+                        if only_slot not in self.slots:
+                            for sl in self.slots:
+                                if sl in only_slot:
+                                    only_slot = sl
+                                    break
+
+                        state[only_slot] = transc_w
+                        continue
+                    if tag_w != transc_w:
+                        hold = False
+                        break
+
+                if not hold:
+                    continue
+
+                for k,v in state.items():
+                    if not v:
+                        continue
+                    real_val = self._find_slot_and_val(v)
+                    if not real_val:
+                        print(state)
+                        print(transc)
+                        print(tag)
+                        input()
+                break
+
+    def _find_slot_and_val(self, w):
+        for k,v in self.vv.ontology.items():
+            if w in v:
+                return k, v
+            for alt, alt_vals in self.vv.alternatives.items():
+                if w in alt_vals:
+                    return k, alt
+        return None
+               
 
