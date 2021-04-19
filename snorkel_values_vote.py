@@ -11,8 +11,9 @@ import get_data
 import bertbst_model
 
 from pylev import levenshtein as distance
+from pyphonetics import RefinedSoundex
 
-ASR_THRESHOLD = .15
+ASR_THRESHOLD = .10
 
 class ValueVoter:
 
@@ -75,6 +76,7 @@ class ValueVoter:
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
                 self.dontcare_vote, self.whatabout_vote, self.any_x, self.slot_support
+                #self.para_vote
         ]
         self.fixing_functions = [
                 #self.exclude_slot
@@ -103,6 +105,21 @@ class ValueVoter:
                 "(?:price|pricerange|price range))")
         }
 
+        self.para_voter = ParaphrasingVoter(self.center.dataframe, self)
+
+    def para_vote(self, slot):
+
+        def give_para_vote(x: pd.Series):
+
+            for state in self.para_voter.states:
+                if x.dial != state["dial"]:
+                    continue
+                if slot not in state["state"]:
+                    return -1
+                return self.ontology[slot].index(state["state"][slot])
+            return -1
+
+        return give_para_vote
 
     def check_asr(self, x, func, real=False, **kwargs):
         if real:
@@ -189,16 +206,19 @@ class ValueVoter:
             transc = x.transcription if not real else x.real_transcription
 
             whatabout_regexp = re.search(
-                    r"((what|how) about|is it) \w+",
+                    r"(?:(what|how) about|is it) (\w)+",
                     transc
             )
             if not whatabout_regexp:
                 if not cont: 
                     return -1
-
+                
                 return self.check_asr(x, vote_whatabout, real=real, cont=False)
-
-
+            
+            slot_check = slot if slot != "pricerange" else "price ?(range)?" 
+            if "any" in transc and re.search(slot_check, transc) is not None:
+                return len(self.ontology[slot])
+            ## check for phonetics etc as well maybe
             return self.vote_for_slot(slot)(x, real=real)
 
         return vote_whatabout
@@ -577,11 +597,11 @@ class SnorkelDialogueVoter:
     def __init__(self, center):
         self.center = center
         self.functions = [
-            self.find_missing_val, self.keyword_found_no_val
+            #self.find_missing_val, self.keyword_found_no_val
         ]
 
         self.price_functions = [
-            self.budget_hit
+            #self.budget_hit
         ]
         self.function_map = {
             "food": [],
@@ -742,7 +762,7 @@ class SnorkelFixingVoter:
     def __init__(self, center):
         self.center = center
         self.fixing_functions = [
-                self.vote_no_last
+                #self.vote_no_last
         ]
 
     def get_functions(self, slot):
@@ -928,6 +948,115 @@ class depr_SystemStateParser:
         return approx
 
 
+class ParaphrasingVoter:
+
+    def __init__(self, df, value_voter):
+        tagger = ParaphrasingTagger(df, value_voter)
+        self.states = tagger.parse()
+        
+
+class TaggedUtterance:
+
+    slots = ("food", "area", "pricerange")
+
+    def __init__(self, sent, dial, *args):
+        self.sent = sent
+        self.dial = dial
+        self.tagged = self.parse(*args)
+
+    def parse(self, vote_func, ontology, threshold=ASR_THRESHOLD):
+        slotvals = [
+            vote_func(slot, threshold=threshold)(None, only_transc=self.sent)
+            for slot in self.slots
+        ]
+        transc = self.sent
+        orig_transc = self.sent
+        for slotname, slotval in zip(self.slots, slotvals):
+            if slotval == -1 or slotval == len(ontology[slotname]):
+                continue
+            transc = transc.replace(ontology[slotname][slotval], 
+                    f"${slotname}")
+        if "$" in transc and len(
+                [tr for tr in transc.split() if "$" not in tr]
+        ) > 0:
+            return transc
+        return None
+
+
+class ParaphrasingApplier:
+
+    slots = ("food", "area", "pricerange")
+
+    def __init__(self, tags):
+        self.tags = [tag for tag in tags if tag.tagged is not None]
+        self.metric = RefinedSoundex()
+
+    def _resolve_tag(self, spl_tag, spl_transc):
+        state = {s: "" for s in self.slots}
+        for tag_w, transc_w in zip(spl_tag, spl_transc):
+            if "$" in tag_w:
+                only_slot = tag_w.replace("$", "")
+                if only_slot not in self.slots:
+                    for sl in self.slots:
+                        if sl in only_slot:
+                            only_slot = sl
+                            break
+                
+                state[only_slot] = transc_w
+                continue
+            if tag_w != transc_w:
+                return state, False
+        return state, True
+
+    def parse(self, transcription, dial, ontology, *args):
+        """
+        For an incoming transcription, go through tags and find the alternative
+        with the shortest phonetic distance.
+        """
+        spl_transc = transcription.split()
+        for tag in self.tags:
+            if tag.dial == dial or len(spl_transc) != len(tag.sent.split()):
+                continue
+            spl_tag = tag.tagged.split()
+            state, hold = self._resolve_tag(spl_tag, spl_transc)
+            
+            if not hold:
+                continue
+
+            parsed_state = {"dial": dial, "state": {}}
+            distances = {}
+            for k,v in state.items():
+                if not v:
+                    continue
+                real_val = self._find_slot_and_val(k, v, ontology, *args)
+                if not real_val:
+                    best_dist = 9999
+                    best_alt = ""
+                    for ont_val in ontology[k]:
+                        if (dist := self.metric.distance(v, ont_val)) < best_dist:
+                            best_dist = dist
+                            best_alt = ont_val
+                    if best_alt and best_dist <= 1 and best_alt != "thai":
+                        distances[k] = best_dist
+                        parsed_state["state"][k] = best_alt
+                else:
+                    parsed_state["state"][k] = real_val
+
+            if [k for k,v in state.items() if v]  != [k for k in parsed_state["state"].keys()]:
+                return None
+
+            return parsed_state
+        return None
+            
+    def _find_slot_and_val(self, slot, w, ontology, alternatives):
+        if w in ontology[slot]:
+            return w
+        for alt, alt_vals in alternatives.items():
+            if w in alt_vals and alt in ontology[slot]:
+                return alt
+        return None
+            
+
 class ParaphrasingTagger:
 
     threshold = ASR_THRESHOLD
@@ -942,86 +1071,75 @@ class ParaphrasingTagger:
         return [asr[0] for asr in turn.asr if asr[1] > self.threshold]
 
     def _fetch_first_utterances(self, df):
-        return [self._get_valid_asrs(turn) for _, turn in df.iterrows()]
-
-    def tag_transcs(self, transcriptions: [str]):
-        tags = []
-        for transc in tqdm([asr for tr in transcriptions for asr in tr]):
-            if not transc:
+        first_utts = []
+        for _, turn in df.iterrows():
+            asr = self._get_valid_asrs(turn)
+            if len(asr) == 0:
                 continue
-            slotvals = [
-                self.vv.vote_for_slot(slot, threshold=self.threshold)(None,
-                    only_transc=transc)
-                for slot in self.slots
-            ]
-            orig_transc = transc
-            for slotname, slotval in zip(self.slots, slotvals):
-                if slotval == -1 or slotval == len(self.vv.ontology[slotname]):
-                    continue
-                transc = transc.replace(self.vv.ontology[slotname][slotval], 
-                        f"${slotname}")
-            if "$" in transc and len(
-                    [tr for tr in transc.split() if "$" not in tr]
-            ) > 0:
-                tags.append((orig_transc, transc))
-        return list(set(tags))
+            first_utts.extend([(uttr, turn.dial) for uttr in asr])
+        return first_utts
 
+    def _first_turn_from_each_dial(self):
+        return pd.DataFrame([
+            turn for turn_idx, turn in self.df.iterrows()
+            if turn_idx == min(self.df.query("dial == '%s'" % turn.dial).index)
+        ])
+
+    def tag_transcs(self, transcriptions: [(str, str)]):
+        tags = []
+        blacklist = []
+        for transc in tqdm(transcriptions):
+            if len(transc) == 0 or (len(transc) == 2 and len(transc[0]) == 0):
+                continue
+            tr, dial = transc
+            tagged_entry = TaggedUtterance(tr,
+                                           dial,
+                                           self.vv.vote_for_slot,
+                                           self.vv.ontology)
+            if tagged_entry.tagged in blacklist:
+                continue
+            blacklist.append(tagged_entry.tagged)
+            tags.append(tagged_entry)
+        return tags
 
     def parse(self):
         transcriptions = self._fetch_first_utterances(
-                self.df.drop_duplicates(subset="dial")
+                self._first_turn_from_each_dial()
         )
-        return self.tag_transcs(transcriptions)
+        tagged_transcs = self.tag_transcs(transcriptions)
+        return self.find_examples(tagged_transcs)
 
-    def find_bad_examples(self, tagged):
-        only_tagged = [x[1] for x in tagged]
-        for transc in tqdm([
-                asr for tr in self._fetch_first_utterances(
-                    self.df.drop_duplicates(subset="dial")
-                ) for asr in tr
-        ]):
-            spl_transc = transc.split()
-            for tag in only_tagged:
-                if len(spl_tag := tag.split()) != len(spl_transc):
-                    continue
-                hold = True
-                state = {k: "" for k in self.slots}
-                for tag_w, transc_w in zip(spl_tag, spl_transc):
-                    if "$" in tag_w:
-                        only_slot = tag_w.replace("$", "")
-                        if only_slot not in self.slots:
-                            for sl in self.slots:
-                                if sl in only_slot:
-                                    only_slot = sl
-                                    break
-
-                        state[only_slot] = transc_w
-                        continue
-                    if tag_w != transc_w:
-                        hold = False
-                        break
-
-                if not hold:
-                    continue
-
-                for k,v in state.items():
-                    if not v:
-                        continue
-                    real_val = self._find_slot_and_val(v)
-                    if not real_val:
-                        print(state)
-                        print(transc)
-                        print(tag)
-                        input()
-                break
-
-    def _find_slot_and_val(self, w):
-        for k,v in self.vv.ontology.items():
-            if w in v:
-                return k, v
-            for alt, alt_vals in self.vv.alternatives.items():
-                if w in alt_vals:
-                    return k, alt
-        return None
-               
+    def find_examples(self, tagged):
+        applier = ParaphrasingApplier(tagged)
+        states = []
+        for _ , turn in self.df.iterrows():
+            if turn.name != min(self.df.query("dial == '%s'" % turn.dial).index):
+                continue
+            attempt = applier.parse(turn.transcription, turn.dial, self.vv.ontology,
+                    self.vv.alternatives)
+            if attempt is not None:
+                states.append(attempt)
+            #preds = {}
+            #attempts = []
+            #for transc, score in turn.asr:
+            #    if score < self.threshold:
+            #        break
+            #    attempt = applier.parse(transc, turn.dial, self.vv.ontology, self.vv.alternatives)
+            #    if attempt is not None:
+            #        state_repr = "¤".join(attempt["state"].values())
+            #        addition = preds[state_repr] + score if state_repr in preds else score
+            #        preds[state_repr] = addition
+            #        attempts.append(attempt)
+            #if len(preds.items()) == 0:
+            #    continue
+            #best_pred = list(sorted(preds.items(), key=lambda x: x[1], reverse=True))[0][0]
+            #right_attempt = [att for att in attempts 
+            #        if "¤".join(att["state"].values()) == best_pred][0]
+            #if len(right_attempt) == 0:
+            #    continue
+            #
+            #right_attempt["turn_no"] = turn.name - min(
+            #        self.df.query("dial == '%s'" % turn.dial).index)
+            #states.append(right_attempt)
+        return states
 

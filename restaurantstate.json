@@ -1,0 +1,567 @@
+{
+    "ali baba": {
+        "food": "lebanese",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "anatolia": {
+        "food": "turkish",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "ask": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "backstreet bistro": {
+        "food": "gastropub",
+        "area": null,
+        "pricerange": "expensive"
+    },
+    "bangkok city": {
+        "food": "thai",
+        "area": "centre",
+        "pricerange": null
+    },
+    "bedouin": {
+        "food": "african",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "bloomsbury restaurant": {
+        "food": "international",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "caffe uno": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "cambridge lodge restaurant": {
+        "food": "european",
+        "area": "west",
+        "pricerange": "expensive"
+    },
+    "charlie chan": {
+        "food": "chinese",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "chiquito restaurant bar": {
+        "food": "mexican",
+        "area": "south",
+        "pricerange": "expensive"
+    },
+    "city stop restaurant": {
+        "food": null,
+        "area": "north",
+        "pricerange": "expensive"
+    },
+    "clowns cafe": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "cocum": {
+        "food": "indian",
+        "area": "west",
+        "pricerange": null
+    },
+    "cote": {
+        "food": "french",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "cotto": {
+        "food": "british",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "curry garden": {
+        "food": "indian",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "curry king": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "curry prince": {
+        "food": "indian",
+        "area": "east",
+        "pricerange": "moderate"
+    },
+    "curry queen": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "da vinci pizzeria": {
+        "food": "italian",
+        "area": "north",
+        "pricerange": "cheap"
+    },
+    "da vince pizzeria": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "darrys cookhouse and wine shop": {
+        "food": "european",
+        "area": "centre",
+        "pricerange": null
+    },
+    "de luca cucina and bar": {
+        "food": "european",
+        "area": null,
+        "pricerange": "moderate"
+    },
+    "dojo noodle bar": {
+        "food": "asian oriental",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "don pasquale pizzeria": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "efes restaurant": {
+        "food": "turkish",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "eraina": {
+        "food": "european",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "fitzbillies restaurant": {
+        "food": "british",
+        "area": "centre",
+        "pricerange": null
+    },
+    "frankie and bennys": {
+        "food": "italian",
+        "area": "south",
+        "pricerange": "expensive"
+    },
+    "galleria": {
+        "food": "european",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "golden house": {
+        "food": "chinese",
+        "area": "centre",
+        "pricerange": null
+    },
+    "golden wok": {
+        "food": "chinese",
+        "area": "north",
+        "pricerange": "moderate"
+    },
+    "gourmet burger kitchen": {
+        "food": "north american",
+        "area": "north",
+        "pricerange": "expensive"
+    },
+    "graffiti": {
+        "food": "british",
+        "area": "west",
+        "pricerange": "expensive"
+    },
+    "grafton hotel restaurant": {
+        "food": "british",
+        "area": "east",
+        "pricerange": "expensive"
+    },
+    "hakka": {
+        "food": "chinese",
+        "area": "north",
+        "pricerange": null
+    },
+    "hk fusion": {
+        "food": "chinese",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "hotel du vin and bistro": {
+        "food": "european",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "india house": {
+        "food": "indian",
+        "area": "west",
+        "pricerange": null
+    },
+    "j restaurant": {
+        "food": "asian oriental",
+        "area": "centre",
+        "pricerange": null
+    },
+    "jinling noodle bar": {
+        "food": "chinese",
+        "area": null,
+        "pricerange": "moderate"
+    },
+    "kohinoor": {
+        "food": "indian",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "kymmoy": {
+        "food": "asian oriental",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "la margherita": {
+        "food": "italian",
+        "area": "west",
+        "pricerange": "cheap"
+    },
+    "la mimosa": {
+        "food": "mediterranean",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "la raza": {
+        "food": "spanish",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "la tasca": {
+        "food": "spanish",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "lan hong house": {
+        "food": "chinese",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "little seoul": {
+        "food": "korean",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "loch fyne": {
+        "food": "seafood",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "mahal of cambridge": {
+        "food": "indian",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "maharajah tandoori restaurant": {
+        "food": "indian",
+        "area": "west",
+        "pricerange": null
+    },
+    "meghna": {
+        "food": "indian",
+        "area": "north",
+        "pricerange": "moderate"
+    },
+    "meze bar restaurant": {
+        "food": "turkish",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "michaelhouse cafe": {
+        "food": "european",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "midsummer house restaurant": {
+        "food": "british",
+        "area": "centre",
+        "pricerange": null
+    },
+    "nandos": {
+        "food": "portuguese",
+        "area": "south",
+        "pricerange": "cheap"
+    },
+    "nandos city centre": {
+        "food": "portuguese",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "panahar": {
+        "food": null,
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "peking restaurant": {
+        "food": "chinese",
+        "area": "south",
+        "pricerange": "expensive"
+    },
+    "pipasha restaurant": {
+        "food": "indian",
+        "area": "east",
+        "pricerange": "expensive"
+    },
+    "pizza express": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "pizza express fen ditton": {
+        "food": null,
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "pizza hut": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "pizza hut city centre": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": null
+    },
+    "pizza hut cherry hinton": {
+        "food": "italian",
+        "area": "south",
+        "pricerange": "moderate"
+    },
+    "pizza hut fen ditton": {
+        "food": "italian",
+        "area": "east",
+        "pricerange": "moderate"
+    },
+    "prezzo": {
+        "food": "italian",
+        "area": "west",
+        "pricerange": "moderate"
+    },
+    "rajmahal": {
+        "food": "indian",
+        "area": "east",
+        "pricerange": "moderate"
+    },
+    "restaurant alimentum": {
+        "food": "european",
+        "area": "south",
+        "pricerange": "moderate"
+    },
+    "restaurant one seven": {
+        "food": "british",
+        "area": null,
+        "pricerange": "moderate"
+    },
+    "restaurant two two": {
+        "food": "french",
+        "area": "north",
+        "pricerange": "expensive"
+    },
+    "rice boat": {
+        "food": "indian",
+        "area": "west",
+        "pricerange": null
+    },
+    "rice house": {
+        "food": "chinese",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "riverside brasserie": {
+        "food": "european",
+        "area": null,
+        "pricerange": "moderate"
+    },
+    "royal spice": {
+        "food": "indian",
+        "area": "north",
+        "pricerange": "cheap"
+    },
+    "royal standard": {
+        "food": "gastropub",
+        "area": "east",
+        "pricerange": "expensive"
+    },
+    "saffron brasserie": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "saigon city": {
+        "food": "asian oriental",
+        "area": "north",
+        "pricerange": "expensive"
+    },
+    "saint johns chop house": {
+        "food": "british",
+        "area": "west",
+        "pricerange": "moderate"
+    },
+    "sala thong": {
+        "food": "thai",
+        "area": "west",
+        "pricerange": null
+    },
+    "sesame restaurant and bar": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "shanghai family restaurant": {
+        "food": "chinese",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "shiraz restaurant": {
+        "food": "mediterranean",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "sitar tandoori": {
+        "food": "indian",
+        "area": "east",
+        "pricerange": "expensive"
+    },
+    "stazione restaurant and coffee bar": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "taj tandoori": {
+        "food": "indian",
+        "area": "south",
+        "pricerange": "expensive"
+    },
+    "tandoori palace": {
+        "food": "indian",
+        "area": "north",
+        "pricerange": "expensive"
+    },
+    "tang chinese": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "thanh binh": {
+        "food": "vietnamese",
+        "area": "west",
+        "pricerange": "cheap"
+    },
+    "the cambridge chop house": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "the copper kettle": {
+        "food": "british",
+        "area": "centre",
+        "pricerange": null
+    },
+    "the cow pizza kitchen and bar": {
+        "food": "gastropub",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "the gandhi": {
+        "food": "indian",
+        "area": null,
+        "pricerange": "cheap"
+    },
+    "the gardenia": {
+        "food": "mediterranean",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "the golden curry": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "the good luck chinese food takeaway": {
+        "food": "chinese",
+        "area": "south",
+        "pricerange": "expensive"
+    },
+    "the hotpot": {
+        "food": "chinese",
+        "area": "north",
+        "pricerange": "expensive"
+    },
+    "the lucky star": {
+        "food": "chinese",
+        "area": "south",
+        "pricerange": "cheap"
+    },
+    "the missing sock": {
+        "food": "international",
+        "area": "east",
+        "pricerange": "cheap"
+    },
+    "the nirala": {
+        "food": "indian",
+        "area": "north",
+        "pricerange": "moderate"
+    },
+    "the oak bistro": {
+        "food": "british",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "the river bar steakhouse and grill": {
+        "food": "european",
+        "area": "centre",
+        "pricerange": "cheap"
+    },
+    "the slug and lettuce": {
+        "food": null,
+        "area": "centre",
+        "pricerange": null
+    },
+    "the varsity restaurant": {
+        "food": "international",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "travellers rest": {
+        "food": null,
+        "area": "west",
+        "pricerange": "expensive"
+    },
+    "ugly duckling": {
+        "food": null,
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "venue": {
+        "food": null,
+        "area": null,
+        "pricerange": null
+    },
+    "wagamama": {
+        "food": "japanese",
+        "area": "centre",
+        "pricerange": "expensive"
+    },
+    "yippee noodle bar": {
+        "food": "asian oriental",
+        "area": "centre",
+        "pricerange": "moderate"
+    },
+    "yu garden": {
+        "food": "chinese",
+        "area": "east",
+        "pricerange": "expensive"
+    },
+    "zizzi cambridge": {
+        "food": "italian",
+        "area": "centre",
+        "pricerange": "cheap"
+    }
+}

@@ -29,11 +29,12 @@ class SnorkelCenter:
 
         self.func_order = [
                 "val_in_text", "val_in_response", "val_in_request",
-                "woz_label", "dontcare_value", "whatabout_vote"
+                "dontcare_value", "vote_whatabout", "dontcare_x",
+                "support_val", #"give_para_vote", "find_example",
+                #"keyword_found"
         ]
         base_funcs = self.func_order.copy()
-        self.func_order.extend([f"{x}_exclude_func" for x in base_funcs])
-        self.func_order.extend([f"{x}_vote_invalid" for x in base_funcs])
+        #self.func_order.extend([f"{x}_last_vote_no" for x in base_funcs])
 
         self.slots = ("food", "area", "pricerange")
 
@@ -125,7 +126,7 @@ class SnorkelCenter:
             "dialogue_idx": dix,
             "dialogue": [{
                 "turn_label": [],
-                "asr": [],
+                "asr": turn.asr,
                 "system_transcript": turn.system_utterance,
                 "turn_idx": turn.turn_no,
                 "transcript": turn.transcription,
@@ -189,6 +190,8 @@ class SnorkelCenter:
     def apply_snorkel_model(self, slot):
         matrix = []
         relevant_cols = [col for col in self.dataframe.columns if f"{slot}_lf" in col]
+        if slot == "pricerange":
+            self.func_order.insert(len(self.func_order)-1, "budget_hit")
         relevant_cols.sort(
                 key=lambda x: self.func_order.index(x.split(f"{slot}_lf_")[-1])
         )
@@ -197,12 +200,6 @@ class SnorkelCenter:
         
         matrix = np.asarray(matrix)
         label_model = LabelModel(cardinality = len(self.ontology[slot]) + 102, verbose=True)
-        print("Max value", matrix.max())
-        print("Argmax", matrix.argmax())
-        print("For slot", slot)
-        print("With shape", matrix.shape)
-        print("Cardinality", label_model.cardinality)
-        print("aka", len(self.ontology[slot]) + 101)
         label_model.fit(L_train=matrix, n_epochs=800, log_freq=100, seed=607)
         res = label_model.predict(matrix)
         for i, pred in enumerate(res):
@@ -214,7 +211,7 @@ class SnorkelCenter:
 
     def snorkel_vote(self):
         dials = self._file_format()
-        self._vote_to_frame(self.vote_to_frame)
+        self.cast_votes()
         for slot in ["food", "area", "pricerange"]:
             self.apply_snorkel_model(slot)
         turn_index = 0
@@ -403,7 +400,7 @@ class FuncStats:
         self.overlap_total_count = 0
         self.conflict_total_count = 0
         self.times_applied = len(df.query(f"{lf.name} > -1"))
-        self.coverage = self.times_applied/len(df)
+        self.coverage = round((self.times_applied/len(df))*100, 1)
         self.parse()
 
     def parse(self):
@@ -414,8 +411,8 @@ class FuncStats:
         overlap = len(set(overlap_turns))
         conflict = len(set(conflict_turns))
         if self.times_applied > 0:
-            self.overlap_rate = overlap/self.times_applied
-            self.conflict_rate = conflict/self.times_applied
+            self.overlap_rate = round((overlap/self.times_applied)*100, 1)
+            self.conflict_rate = round((conflict/self.times_applied)*100, 1)
 
         self.overlap_turn_count = overlap
         self.conflict_turn_count = conflict
