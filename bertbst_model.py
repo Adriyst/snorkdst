@@ -23,6 +23,7 @@ from dst_util import tokenize_text_and_label, get_token_label_ids, get_start_end
 from get_data import DataFetcher
 
 BERT_VOCAB_LOC = "/usr/local/Development/bert/vocab.txt"
+MODEL_DIR = "/run/media/adriantysnes/HDD/models/"
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +124,50 @@ class PrePrepped:
             os.path.join(self.BASE_PATH, f"dstc2_{version}_en.json"),
             self.SLOTS, version_type, **kwargs
         )
-        loaded_map[version] = loaded_set
-        return loaded_set
+        grouped_set = self._group_set(loaded_set)
+        loaded_map[version] = grouped_set
+        return grouped_set
+
+    def _group_set(self, example_set):
+        print("grouping set...")
+        grouping = {}
+        all_ex = []
+        curr_guid = ""
+        for ex in example_set:
+            if ex.guid not in grouping:
+                grouping[ex.guid] = []
+                if len(curr_guid) > 0:
+                    all_ex.append(GroupedFeatures(grouping[curr_guid]))
+                curr_guid = ex.guid
+            grouping[ex.guid].append(ex)
+        print("Set grouped")
+        return all_ex 
+        
+
+class GroupedFeatures:
+
+    def __init__(self, group):
+        self.group = sorted(group, reverse=True, key=lambda x: x.asr_score)
+        self.valid = len(self.group) > 0
+        if self.valid:
+            self.guid = self.group[0].guid
+            self.text_a = self.group[0].text_a
+            self.text_a_label = self.group[0].text_a_label
+            self.text_b, self.text_b_label = self.find_pointed_asr()
+            self.class_label = self.group[0].class_label
+            self.asrs = [x.asr_score for x in self.group]
+            self.all_texts = [x.text_b for x in self.group]
+            self.session_id = self.group[0].session_id
+
+
+    def find_pointed_asr(self):
+        for ex in self.group:
+            for idx_labeling in (ex.text_b_label, ex.text_a_label):
+                if any(idx_labeling):
+                    return ex.text_b, ex.text_b_label
+        return (self.group[0].text_b, self.group[0].text_b_label) \
+                if len(self.group) > 0 else ([], [])
+
 
 
 class DataLoader:
@@ -150,6 +193,7 @@ class DataLoader:
         starts = {k: [] for k in slots}
         ends = deepcopy(starts)
         class_types = ["none", "dontcare", "copy_value"]
+        turn_based_bert = {}
         for turn in turns:
             class_label_id_dict = {}
             for slot in ["food", "area", "price range"]:
@@ -167,6 +211,9 @@ class DataLoader:
                 startvals, endvals = get_start_end_pos(
                     turn.class_label[slot], token_label_ids, max_len
                 )
+                if len(tokens_b) == 0:
+                    tokens_b.append("[UNK]")
+
                 bert_tok = bert_tokenizer.encode_plus(tokens_a, tokens_b,
                         padding='max_length', max_length=80)
                 
@@ -185,8 +232,20 @@ class DataLoader:
                 lablist.append(lab)
 
             labels.append(turn.class_label)
+            all_feats = {"input_ids": [], "attention_mask": [], "token_type_ids": []}
+            all_asrs = []
+            for txt, asr in zip(turn.all_texts, turn.asrs):
+                if len(txt) == 0:
+                    txt.append("[UNK]")
+                berted = bert_tokenizer.encode_plus(turn.text_a, txt,
+                        padding='max_length', max_length=80)
+                for k,v in berted.items():
+                    all_feats[k].append(v)
+                all_asrs.append(asr)
+            turn_based_bert[turn.guid] = (all_feats, all_asrs)
+
         return FeatureBatchSet(input_ids, masks, types, starts, ends, food_labels,
-                area_labels, price_labels)
+                area_labels, price_labels, turn_based_bert)
 
 
 class BertNet(nn.Module):
@@ -200,6 +259,7 @@ class BertNet(nn.Module):
         self.tokenizer = BertTokenizer.from_pretrained(self.BERT_VERSION)
         self.bert = BertModel.from_pretrained(self.BERT_VERSION)
         emb_dim = self.bert.get_input_embeddings().embedding_dim
+        self.emb_dim = emb_dim
         self.food_a = nn.Linear(emb_dim, 3)
         self.area_a = nn.Linear(emb_dim, 3)
         self.price_a = nn.Linear(emb_dim, 3)
@@ -224,10 +284,10 @@ class BertNet(nn.Module):
             self.softmax.cuda()
             self.loss_fn.cuda()
 
-        self.optim = Adam(self.parameters(), lr=2e-5)
+        self.optim = Adam(self.parameters(), lr=1e-5)
 
         self.epochs = 30
-        self.train_bsize = 32
+        self.train_bsize = 4
 
         self.slots = ["food", "area", "pricerange"]
         self.ontology = DataFetcher.fetch_dstc_ontology()["informable"]
@@ -246,7 +306,7 @@ class BertNet(nn.Module):
         
         for epoch in range(self.epochs):
             batch_generator = self.loader.fetch_batch(
-                    self.preprep.fetch_set(mode),
+                    self.preprep.fetch_set(mode, use_asr_hyp=10),
                     self.train_bsize, self.slots, self.tokenizer
             )
             self.train()
@@ -257,7 +317,7 @@ class BertNet(nn.Module):
 
             for batch in batch_generator:
                 self.zero_grad()
-                class_logits, pos_logits = self(batch.to_bert_format())
+                class_logits, pos_logits = self(batch)
                 predset = PredictionSet(*class_logits, *pos_logits)
 
                 loss = 0
@@ -293,10 +353,16 @@ class BertNet(nn.Module):
             logger.info("Class loss for epoch: %s" % epoch_class_loss)
             logger.info("Dev loss:")
             devacc = self.predict()
-            if devacc > best_acc and devacc > .5:
-                best_acc = devacc
-                torch.save(self.state_dict(), open(f"./bertdst-light-{mode}.pt", "wb"))
-                torch.save(self.bert.state_dict(), open(f"./light-bertstate-{mode}.pt", "wb"))
+            torch.save(self.state_dict(),
+                    open(f"{MODEL_DIR}bertdst-light-{mode}-{epoch}.pt", "wb")
+            )
+            torch.save(self.bert.state_dict(),
+                    open(f"{MODEL_DIR}light-bertstate-{mode}-{epoch}.pt", "wb")
+            )
+            #if devacc > best_acc and devacc > .5:
+            #    best_acc = devacc
+            #    torch.save(self.state_dict(), open(f"./bertdst-light-{mode}.pt", "wb"))
+            #    torch.save(self.bert.state_dict(), open(f"./light-bertstate-{mode}.pt", "wb"))
             logger.info("#" * 30)
 
 
@@ -485,11 +551,21 @@ class BertNet(nn.Module):
         dial_struct = self._fetch_predictset(mode)
         currid = ""
         lastid = ""
+        eval_json = {}
 
-        for dial in dial_struct:
+        for dial_idx, dial in enumerate(dial_struct):
+            eval_json[dial[0].session_id] = []
             nully = True
+            true_gold_labs = {}
+            preddies =  {}
             pos_correct = {k:True for k in self.slots}
             for turn in dial:
+                turn_no = int(turn.guid.split("-")[-1])
+                eval_json[turn.session_id].append({})
+                for k,v in turn.class_label.items():
+                    if v != "none":
+                        true_gold_labs[k] = v
+                    true_gold_labs
                 if currid != turn.session_id:
                     currid = turn.session_id
 
@@ -510,21 +586,32 @@ class BertNet(nn.Module):
                     if predset:
                         pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
                         pred_pos = predset.eval_format(p_slot)
+                        if pred_cls == 2:
+                            eval_json[turn.session_id][-1]["pred_pos"] = \
+                                    [pred_pos.index(l) for l in pred_pos if l > 0]
+
                     else:
                         pred_cls = 0
 
+                    if pred_cls > 0:
+                        preddies[slot] = pred_cls
                     if turn.class_label[slot] == "copy_value":
                         nully = False
+                        labs = turn.text_a_label[slot].copy()
+                        labs.extend(turn.text_b_label[slot])
+                        while len(labs) < len(pred_pos):
+                            labs.append(0)
+
+                        eval_json[turn.session_id][-1]["goal_pos"] = \
+                                [labs.index(l) for l in labs if l > 0]
+
                         if pred_cls != 2:
                             pos_correct[p_slot] = False
                             cls_error_fasit += 1
                             slot_misses[slot] += 1
                             continue
 
-                        labs = turn.text_a_label[slot].copy()
-                        labs.extend(turn.text_b_label[slot])
-                        while len(labs) < len(pred_pos):
-                            labs.append(0)
+
 
                         if labs != pred_pos:
                             pos_correct[p_slot] = False
@@ -533,26 +620,42 @@ class BertNet(nn.Module):
                             pos_correct[p_slot] = True
 
                     elif turn.class_label[slot] == "dontcare":
+                        nully = False
                         if pred_cls != 1:
                             pos_correct[p_slot] = False
-                            nully = False
                             dontcare_error += 1
                             slot_misses[slot] += 1
                         else:
                             pos_correct[p_slot] = True
-                    else:
+                    elif turn.class_label[slot]:
                         if pred_cls != 0:
                             slot_misses[slot] += 1
                             pos_correct[slot] = False
                             nully = False
                             cls_error_pred += 1
                             continue
+                eval_json[turn.session_id][-1]["transcript"] = turn.text_b
+                for k,v in preddies.items():
+                    eval_json[turn.session_id][-1][f"pred_{k}"] = v
+                map = {
+                    "copy_value": 2,
+                    "none": 0,
+                    "dontcare": 1,
+                    "unpointable": 3
+                }
+                for k,v in true_gold_labs.items():
+                    eval_json[turn.session_id][-1][f"real_{k}"] = map[v]
                 if nully:
+                    eval_json[turn.session_id][-1]["status"] = "null"
                     continue
                 if all(pos_correct.values()):
                     good += 1
+                    eval_json[turn.session_id][-1]["status"] = "good"
                 else:
+                    eval_json[turn.session_id][-1]["status"] = "bad"
                     bad += 1
+        if mode == "test":
+            json.dump(eval_json, open("./evaljson.json", "w"))
         print("#"*30)
         print("Slots missed:")
         for k,v in slot_misses.most_common():
@@ -569,7 +672,22 @@ class BertNet(nn.Module):
 
     def forward(self, X, train=True):
 
-        seq, comb = self.bert(**X).to_tuple()
+        bsize = self.train_bsize if train else 1
+        seq = check_cuda_float(torch.zeros((bsize, 80, self.emb_dim)))
+        comb = check_cuda_float(torch.zeros((bsize, self.emb_dim)))
+        dial_idx = -1
+        curr_dial = ""
+        for dial, feats in X.asr_feats.items():
+            bert_dict, asr = feats
+            if curr_dial != dial:
+                curr_dial = dial
+                dial_idx += 1
+            new_seq, new_comb = self.bert(**bert_dict).to_tuple()
+            for ns in range(len(asr)):
+                seq[dial_idx] += (new_seq[ns] * asr[ns])
+                comb[dial_idx] += (new_comb[ns] * asr[ns])
+            
+        #seq, comb = self.bert(**X).to_tuple()
 
         if train:
             comb = self.dropout(comb)
@@ -612,7 +730,7 @@ class BertNet(nn.Module):
         """
         Helper function to generate a featureset for the predict and develop functions.
         """
-        featureset = self.preprep.fetch_set(mode, use_asr_hyp=1)
+        featureset = self.preprep.fetch_set(mode, use_asr_hyp=1, exclude_unpointable=False)
         dial_struct = []
         current_id = ""
         current_dial = []
@@ -759,7 +877,7 @@ class PredictionSet:
 class FeatureBatchSet:
 
     def __init__(self, inputs, masks, types, starts, ends, food_labels, area_labels,
-            price_labels):
+            price_labels, all_feats):
         self.inputs = check_cuda_stack_long(inputs)
         self.masks = check_cuda_stack_long(masks)
         self.types = check_cuda_stack_long(types)
@@ -792,22 +910,37 @@ class FeatureBatchSet:
                     "second": self.price_end
                 }
         }
+        self.asr_feats = self._format_all_feats(all_feats)
 
     def idx_for_cat(self, cat):
         return torch.where(self.cat_map[cat]["class"] == 2)
 
     def to_bert_format(self):
         return {
-            "input_ids": self.inputs,
-            "attention_mask": self.masks,
-            "token_type_ids": self.types
+                "main": {
+                    "input_ids": self.inputs,
+                    "attention_mask": self.masks,
+                    "token_type_ids": self.types
+                },
+                "asr": self.asr_feats
         }
+
+    def _format_all_feats(self, f):
+        ## input: dict {turn-guid: (bert_dict, [asr])}
+        dicty = {}
+        for turn_guid, berts in f.items():
+            for k,v in berts[0].items():
+                berts[0][k] = check_cuda_stack_long(v)
+            dicty[turn_guid] = berts
+        return dicty
+
 
 
 def pad_to_max_len(tokens, max_len, pad_token):
     while len(tokens) != max_len:
         tokens.append(pad_token)
     return tokens
+
 
 if __name__ == '__main__':
     import sys
@@ -817,16 +950,17 @@ if __name__ == '__main__':
     if arg in ("train", "majority", "snorkel", "majority_pattern_matching",
             "snorkel_pattern_matching"):
         bn.fit(mode=arg)
-    elif arg in ("test", "majority_test", "majority_pattern_matching_test",
+    elif arg in ("validate", "test", "majority_test", "majority_pattern_matching_test",
             "snorkel_test", "snorkel_pattern_matching_test"):
-        arg == "train" if arg == "test" else arg
+        predmode = "test" if arg != "validate" else arg
+        if arg in ("test", "validate"):
+            arg = "train"
         if len(arg.split("_")) == 2:
             arg = arg.split("_")[0]
-        bn.load_state_dict(torch.load(f"./bertdst-light-{arg}.pt"))
-        bn.bert.load_state_dict(torch.load(f"light-bertstate-{arg}.pt"))
-        bn.predict(mode="test")
-    elif arg == "validate":
-        bn.load_state_dict(torch.load("./bertdst-light-train.pt"))
-        bn.bert.load_state_dict(torch.load("light-bertstate-train.pt"))
-        bn.predict()
+        arg = arg if arg != "test" else "train"
+        for ep in range(bn.epochs):
+            print("For model # %s" % ep)
+            bn.load_state_dict(torch.load(f"{MODEL_DIR}bertdst-light-{arg}-{ep}.pt"))
+            bn.bert.load_state_dict(torch.load(f"{MODEL_DIR}light-bertstate-{arg}-{ep}.pt"))
+            bn.predict(mode=predmode)
 

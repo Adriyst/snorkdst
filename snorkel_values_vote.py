@@ -75,7 +75,7 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.dontcare_vote, self.whatabout_vote, self.any_x, self.slot_support
+                self.dontcare_vote#, self.whatabout_vote, self.any_x, self.slot_support
                 #self.para_vote
         ]
         self.fixing_functions = [
