@@ -12,6 +12,7 @@ import pickle
 import json
 import os 
 import numpy as np
+import time
 #from Levenshtein import distance
 # need pure python package for saga
 from pylev import levenshtein
@@ -129,7 +130,6 @@ class PrePrepped:
         return grouped_set
 
     def _group_set(self, example_set):
-        print("grouping set...")
         grouping = {}
         all_ex = []
         curr_guid = ""
@@ -140,7 +140,6 @@ class PrePrepped:
                     all_ex.append(GroupedFeatures(grouping[curr_guid]))
                 curr_guid = ex.guid
             grouping[ex.guid].append(ex)
-        print("Set grouped")
         return all_ex 
         
 
@@ -232,25 +231,29 @@ class DataLoader:
                 lablist.append(lab)
 
             labels.append(turn.class_label)
-            all_feats = {"input_ids": [], "attention_mask": [], "token_type_ids": []}
-            all_asrs = []
-            for txt, asr in zip(turn.all_texts, turn.asrs):
-                if len(txt) == 0:
-                    txt.append("[UNK]")
-                berted = bert_tokenizer.encode_plus(turn.text_a, txt,
-                        padding='max_length', max_length=80)
-                for k,v in berted.items():
-                    all_feats[k].append(v)
-                all_asrs.append(asr)
-            turn_based_bert[turn.guid] = (all_feats, all_asrs)
+            turn_based_bert[turn.guid] = self._sort_asr(turn, bert_tokenizer) 
 
         return FeatureBatchSet(input_ids, masks, types, starts, ends, food_labels,
                 area_labels, price_labels, turn_based_bert)
 
+    def _sort_asr(self, turn, bt):
+        all_feats = {"input_ids": [], "attention_mask": [], "token_type_ids": []}
+        all_asrs = []
+        for txt, asr in zip(turn.all_texts, turn.asrs):
+            if len(txt) == 0:
+                txt.append("[UNK]")
+            berted = bt.encode_plus(turn.text_a, txt,
+                    padding='max_length', max_length=80)
+            for k,v in berted.items():
+                all_feats[k].append(v)
+            all_asrs.append(asr)
+        return all_feats, all_asrs
+
 
 class BertNet(nn.Module):
 
-    BERT_VERSION = "bert-base-uncased"
+    #BERT_VERSION = "bert-base-uncased"
+    BERT_VERSION = "prajjwal1/bert-medium"
 
     def __init__(self):
         super().__init__()
@@ -287,7 +290,7 @@ class BertNet(nn.Module):
         self.optim = Adam(self.parameters(), lr=1e-5)
 
         self.epochs = 30
-        self.train_bsize = 4
+        self.train_bsize = 8
 
         self.slots = ["food", "area", "pricerange"]
         self.ontology = DataFetcher.fetch_dstc_ontology()["informable"]
@@ -303,10 +306,12 @@ class BertNet(nn.Module):
     def fit(self, mode="train"):
 
         best_acc = 0
+
+        dataset = self.preprep.fetch_set(mode, use_asr_hyp=5)
         
         for epoch in range(self.epochs):
             batch_generator = self.loader.fetch_batch(
-                    self.preprep.fetch_set(mode, use_asr_hyp=10),
+                    dataset,
                     self.train_bsize, self.slots, self.tokenizer
             )
             self.train()
@@ -314,8 +319,13 @@ class BertNet(nn.Module):
             logger.info("Starting epoch # %s" % (epoch + 1))
             epoch_class_loss, epoch_pos_loss = 0, 0
             tralse = True
-
+            partition = 0
+            prevlisted = 10
             for batch in batch_generator:
+                partition += round((self.train_bsize/len(dataset))*100, 3)
+                if partition > prevlisted:
+                    logger.info(f"{prevlisted}% of dataset processed")
+                    prevlisted += 10 
                 self.zero_grad()
                 class_logits, pos_logits = self(batch)
                 predset = PredictionSet(*class_logits, *pos_logits)
@@ -339,10 +349,13 @@ class BertNet(nn.Module):
                     epoch_pos_loss += (first_position_loss.item() / num_slot)
                     epoch_pos_loss += (second_position_loss.item() / num_slot)
 
-                    class_loss = self.loss_fn(
-                            predset.cat_map[slot_name]["class"],
-                            batch.cat_map[slot_name]["class"]
-                    ) * .8
+                    try:
+                        class_loss = self.loss_fn(
+                                predset.cat_map[slot_name]["class"],
+                                batch.cat_map[slot_name]["class"]
+                        ) * .8
+                    except ValueError:
+                        class_loss = check_cuda_float([0])
 
                     epoch_class_loss += class_loss.item()
                     loss += first_position_loss + second_position_loss + class_loss
@@ -572,13 +585,10 @@ class BertNet(nn.Module):
                 predset = None
                 if len(turn.text_b) > 0:
                     with torch.no_grad():
-                        class_logits, pos_logits = self(
-                                { k: check_cuda_long(v) for k, v in  
-                                    self.tokenizer.encode_plus(
-                                        turn.text_a, turn.text_b, return_tensors="pt"
-                                    ).items()
-                                    }, train=False
-                        )
+                        txts, asr = self.loader._sort_asr(turn, self.tokenizer)
+                        fbs = FeatureBatchSet([], [], [], [], 
+                                [], [], [], [], {turn.guid: (txts, asr)}, pred=True)
+                        class_logits, pos_logits = self(fbs, train=False)
                     predset = PredictionSet(*class_logits, *pos_logits)
 
                 for slot in ["food", "area", "price range"]:
@@ -656,18 +666,18 @@ class BertNet(nn.Module):
                     bad += 1
         if mode == "test":
             json.dump(eval_json, open("./evaljson.json", "w"))
-        print("#"*30)
-        print("Slots missed:")
+        logger.info("#"*30)
+        logger.info("Slots missed:")
         for k,v in slot_misses.most_common():
-            print(f"{k}: {v} times")
-        print("class fasit error:", cls_error_fasit)
-        print("class pred error:", cls_error_pred)
-        print("dontcare error:", dontcare_error)
-        print("pos error:", pos_error)
-        print("good cnt:", good)
-        print("bad cnt:", bad)
-        print(good/(good+bad))
-        print("#"*30)
+            logger.info(f"{k}: {v} times")
+        logger.info("class fasit error:", cls_error_fasit)
+        logger.info("class pred error:", cls_error_pred)
+        logger.info("dontcare error:", dontcare_error)
+        logger.info("pos error:", pos_error)
+        logger.info("good cnt:", good)
+        logger.info("bad cnt:", bad)
+        logger.info(good/(good+bad))
+        logger.info("#"*30)
         return good/(good+bad)
 
     def forward(self, X, train=True):
@@ -730,7 +740,7 @@ class BertNet(nn.Module):
         """
         Helper function to generate a featureset for the predict and develop functions.
         """
-        featureset = self.preprep.fetch_set(mode, use_asr_hyp=1, exclude_unpointable=False)
+        featureset = self.preprep.fetch_set(mode, use_asr_hyp=5, exclude_unpointable=False)
         dial_struct = []
         current_id = ""
         current_dial = []
@@ -877,39 +887,41 @@ class PredictionSet:
 class FeatureBatchSet:
 
     def __init__(self, inputs, masks, types, starts, ends, food_labels, area_labels,
-            price_labels, all_feats):
-        self.inputs = check_cuda_stack_long(inputs)
-        self.masks = check_cuda_stack_long(masks)
-        self.types = check_cuda_stack_long(types)
-
-        self.food_start = check_cuda_long(starts["food"])
-        self.food_end = check_cuda_long(ends["food"])
-        self.area_start = check_cuda_long(starts["area"])
-        self.area_end = check_cuda_long(ends["area"])
-        self.price_start = check_cuda_long(starts["pricerange"])
-        self.price_end = check_cuda_long(ends["pricerange"])
-
-        self.food_class = check_cuda_long(food_labels)
-        self.area_class = check_cuda_long(area_labels)
-        self.price_class = check_cuda_long(price_labels)
+            price_labels, all_feats, pred=False):
         
-        self.cat_map = {
-                "food": {
-                    "class": self.food_class,
-                    "first": self.food_start,
-                    "second": self.food_end
-                },
-                "area": {
-                    "class": self.area_class,
-                    "first": self.area_start,
-                    "second": self.area_end
-                },
-                "pricerange": {
-                    "class": self.price_class,
-                    "first": self.price_start,
-                    "second": self.price_end
-                }
-        }
+        if not pred:
+            self.inputs = check_cuda_stack_long(inputs)
+            self.masks = check_cuda_stack_long(masks)
+            self.types = check_cuda_stack_long(types)
+
+            self.food_start = check_cuda_long(starts["food"])
+            self.food_end = check_cuda_long(ends["food"])
+            self.area_start = check_cuda_long(starts["area"])
+            self.area_end = check_cuda_long(ends["area"])
+            self.price_start = check_cuda_long(starts["pricerange"])
+            self.price_end = check_cuda_long(ends["pricerange"])
+
+            self.food_class = check_cuda_long(food_labels)
+            self.area_class = check_cuda_long(area_labels)
+            self.price_class = check_cuda_long(price_labels)
+            
+            self.cat_map = {
+                    "food": {
+                        "class": self.food_class,
+                        "first": self.food_start,
+                        "second": self.food_end
+                    },
+                    "area": {
+                        "class": self.area_class,
+                        "first": self.area_start,
+                        "second": self.area_end
+                    },
+                    "pricerange": {
+                        "class": self.price_class,
+                        "first": self.price_start,
+                        "second": self.price_end
+                    }
+            }
         self.asr_feats = self._format_all_feats(all_feats)
 
     def idx_for_cat(self, cat):
