@@ -10,7 +10,8 @@ class InputExample(object):
   """A single training/test example for simple sequence classification."""
 
   def __init__(self, guid, text_a, text_b, text_a_label=None,
-          text_b_label=None, class_label=None, session_id=None):
+          text_b_label=None, class_label=None, session_id=None, 
+          asr_score=None, turn_labels=None):
     """Constructs a InputExample.
     """
     self.guid = guid
@@ -20,6 +21,8 @@ class InputExample(object):
     self.text_b_label = text_b_label
     self.class_label = class_label
     self.session_id = session_id
+    self.asr_score = asr_score
+    self.turn_labels = turn_labels
 
 
 SEMANTIC_DICT = {
@@ -161,12 +164,12 @@ def create_examples(dialog_filename, slot_list, set_type, use_asr_hyp=0,
       if use_asr_hyp == 0:
         usr_utt_tok_list.append(tokenize(turn['transcript']))
       else:
-        for asr_hyp, _ in turn['asr'][:use_asr_hyp]:
-          usr_utt_tok_list.append(tokenize(asr_hyp))
+        for asr_hyp, asr_score in turn['asr'][:use_asr_hyp]:
+            usr_utt_tok_list.append((tokenize(asr_hyp), asr_score))
 
       turn_label = [[FIX.get(s.strip(), s.strip()), FIX.get(v.strip(), v.strip())] for s, v in turn['turn_label']]
 
-      for usr_utt_tok in usr_utt_tok_list:
+      for usr_utt_tok, asr_score in usr_utt_tok_list:
         sys_utt_tok_label_dict = {}
         usr_utt_tok_label_dict = {}
         class_type_dict = {}
@@ -190,7 +193,9 @@ def create_examples(dialog_filename, slot_list, set_type, use_asr_hyp=0,
             text_a_label=sys_utt_tok_label_dict,
             text_b_label=usr_utt_tok_label_dict,
             class_label=class_type_dict,
-            session_id=dial["session-id"]))
+            session_id=dial["session-id"],
+            asr_score=asr_score,
+            turn_labels=turn["turn_label"]))
   return examples
 
 def create_examples_with_history(dialog_filename, slot_list, set_type, use_asr_hyp=0, exclude_unpointable=True):
