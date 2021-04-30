@@ -12,7 +12,6 @@ import pickle
 import json
 import os 
 import numpy as np
-import time
 #from Levenshtein import distance
 # need pure python package for saga
 from pylev import levenshtein
@@ -36,7 +35,6 @@ SEMANTIC_DICT = {
   'north': ['northern', 'uptown', 'northside'],
   'west': ['western', 'westside'],
   'east': ['eastern', 'eastside'],
-  'east side': ['eastern', 'eastside'],
 
   'cheap': ['low price', 'inexpensive', 'cheaper', 'low priced', 'affordable',
             'nothing too expensive', 'without costing a fortune', 'cheapest',
@@ -287,7 +285,7 @@ class BertNet(nn.Module):
             self.softmax.cuda()
             self.loss_fn.cuda()
 
-        self.optim = Adam(self.parameters(), lr=1e-5)
+        self.optim = Adam(self.parameters(), lr=2e-5)
 
         self.epochs = 30
         self.train_bsize = 8
@@ -588,7 +586,12 @@ class BertNet(nn.Module):
                         txts, asr = self.loader._sort_asr(turn, self.tokenizer)
                         fbs = FeatureBatchSet([], [], [], [], 
                                 [], [], [], [], {turn.guid: (txts, asr)}, pred=True)
-                        class_logits, pos_logits = self(fbs, train=False)
+                        feats = { k: check_cuda_long(v) for k, v in  
+                                self.tokenizer.encode_plus(
+                                    turn.text_a, turn.text_b, return_tensors="pt"
+                                ).items()
+                        }
+                        class_logits, pos_logits = self(fbs, train=False, feats_only=feats)
                     predset = PredictionSet(*class_logits, *pos_logits)
 
                 for slot in ["food", "area", "price range"]:
@@ -670,20 +673,19 @@ class BertNet(nn.Module):
         logger.info("Slots missed:")
         for k,v in slot_misses.most_common():
             logger.info(f"{k}: {v} times")
-        logger.info("class fasit error:", cls_error_fasit)
-        logger.info("class pred error:", cls_error_pred)
-        logger.info("dontcare error:", dontcare_error)
-        logger.info("pos error:", pos_error)
-        logger.info("good cnt:", good)
-        logger.info("bad cnt:", bad)
-        logger.info(good/(good+bad))
+        logger.info("class fasit error: %s" % cls_error_fasit)
+        logger.info("class pred error: %s" % cls_error_pred)
+        logger.info("dontcare error: %s" % dontcare_error)
+        logger.info("pos error: %s" % pos_error)
+        logger.info("good cnt: %s" % good)
+        logger.info("bad cnt: %s" % bad)
+        logger.info(str(good/(good+bad)))
         logger.info("#"*30)
         return good/(good+bad)
 
-    def forward(self, X, train=True):
+    def forward(self, X, train=True, feats_only=None):
 
         bsize = self.train_bsize if train else 1
-        seq = check_cuda_float(torch.zeros((bsize, 80, self.emb_dim)))
         comb = check_cuda_float(torch.zeros((bsize, self.emb_dim)))
         dial_idx = -1
         curr_dial = ""
@@ -692,12 +694,12 @@ class BertNet(nn.Module):
             if curr_dial != dial:
                 curr_dial = dial
                 dial_idx += 1
-            new_seq, new_comb = self.bert(**bert_dict).to_tuple()
+            _, new_comb = self.bert(**bert_dict).to_tuple()
             for ns in range(len(asr)):
-                seq[dial_idx] += (new_seq[ns] * asr[ns])
                 comb[dial_idx] += (new_comb[ns] * asr[ns])
             
-        #seq, comb = self.bert(**X).to_tuple()
+        seq, _ = self.bert(**X.to_bert_format()).to_tuple() if feats_only is None else \
+                self.bert(**feats_only).to_tuple()
 
         if train:
             comb = self.dropout(comb)
@@ -929,12 +931,9 @@ class FeatureBatchSet:
 
     def to_bert_format(self):
         return {
-                "main": {
-                    "input_ids": self.inputs,
-                    "attention_mask": self.masks,
-                    "token_type_ids": self.types
-                },
-                "asr": self.asr_feats
+            "input_ids": self.inputs,
+            "attention_mask": self.masks,
+            "token_type_ids": self.types
         }
 
     def _format_all_feats(self, f):
