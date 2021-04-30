@@ -30,11 +30,11 @@ class SnorkelCenter:
         self.func_order = [
                 "val_in_text", "val_in_response", "val_in_request",
                 "dontcare_value", "vote_whatabout", "dontcare_x",
-                "support_val", #"give_para_vote", "find_example",
-                #"keyword_found"
+                "support_val", "give_para_vote", "find_example",
+                "keyword_found"
         ]
         base_funcs = self.func_order.copy()
-        #self.func_order.extend([f"{x}_last_vote_no" for x in base_funcs])
+        self.func_order.extend([f"{x}_last_vote_no" for x in base_funcs])
 
         self.slots = ("food", "area", "pricerange")
 
@@ -77,12 +77,12 @@ class SnorkelCenter:
                     if not isinstance(res, tuple):
                         continue
 
-                    rownam, val = res
+                    rownam, val, affect_idx = res
                     realname = rownam.split(f"{slot}_lf_")[1]
                     lfname = f"{slot}_lf_{realname}_{lf.__name__}"
                     if lfname not in self.dataframe.columns:
                         self.dataframe[lfname] = -1
-                    self.dataframe.at[row_idx, lfname] = val
+                    self.dataframe.at[affect_idx, lfname] = val
 
             # Donezo!
 
@@ -400,7 +400,7 @@ class FuncStats:
         self.overlap_total_count = 0
         self.conflict_total_count = 0
         self.times_applied = len(df.query(f"{lf.name} > -1"))
-        self.coverage = round((self.times_applied/len(df))*100, 1)
+        self.coverage = round((self.times_applied/len(df)), 3)
         self.parse()
 
     def parse(self):
@@ -411,8 +411,8 @@ class FuncStats:
         overlap = len(set(overlap_turns))
         conflict = len(set(conflict_turns))
         if self.times_applied > 0:
-            self.overlap_rate = round((overlap/self.times_applied)*100, 1)
-            self.conflict_rate = round((conflict/self.times_applied)*100, 1)
+            self.overlap_rate = round((overlap/self.times_applied), 3)
+            self.conflict_rate = round((conflict/self.times_applied), 3)
 
         self.overlap_turn_count = overlap
         self.conflict_turn_count = conflict
@@ -536,6 +536,29 @@ class FormatEntry:
             "valinrequest": "VIRQ",
             "dontcarevalue": "DCV",
             "votewhatabout": "VWA",
+            "dontcarex": "DCX",
+            "supportval": "SV",
+            "giveparavote": "PV",
+            "findexample": "FE",
+            "keywordfound": "KWF",
+            "isnegative": "NEG",
+            "valintextlastvoteno": "VIT-LVN",
+            "valinresponselastvoteno": "VIRS-LVN",
+            "valinrequestlastvoteno": "VIRQ-LVN",
+            "dontcarevaluelastvoteno": "DCV-LVN",
+            "supportvallastvoteno": "SV-LVN",
+            "giveparavotelastvoteno": "GPV-LVN",
+            "findexamplelastvoteno": "FE-LVN",
+            "keywordfoundlastvoteno": "KWF-LVN",
+            "valintextvalfromsecond": "VIT-VFS",
+            "valinresponsevalfromsecond": "VIRS-VFS",
+            "valinrequestvalfromsecond": "VIRQ-VFS",
+            "dontcarevaluevalfromsecond": "DCV-VFS",
+            "supportvalvalfromsecond": "SV-VFS",
+            "giveparavotevalfromsecond": "GPV-VFS",
+            "findexamplevalfromsecond": "FE-VFS",
+            "keywordfoundvalfromsecond": "KWF-VFS",
+
             "valintextexcludefunc": "VIT-REJ",
             "valinresponseexcludefunc": "VIRS-REJ",
             "valinrequestexcludefunc": "VIRQ-REJ",

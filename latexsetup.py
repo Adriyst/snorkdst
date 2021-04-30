@@ -18,7 +18,7 @@ def outline(tab, slot):
     return s
 
 sc = SnorkelCenter()
-sc._vote_to_frame(sc.vote_to_frame)
+sc.cast_votes()
 ana = Analyzer(sc.dataframe)
 for slot in ("food", "area", "pricerange"):
     overview = ana.analyze(slot)

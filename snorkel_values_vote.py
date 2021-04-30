@@ -27,6 +27,7 @@ class ValueVoter:
         self.alternatives = bertbst_model.SEMANTIC_DICT
         self.center = center
 
+        self.soundex = RefinedSoundex()
 
         self.welcome_msg = "hello , welcome to the cambridge restaurant system? "\
         "you can ask for restaurants "\
@@ -75,8 +76,8 @@ class ValueVoter:
 
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
-                self.dontcare_vote, self.whatabout_vote, self.any_x, self.slot_support
-                #self.para_vote
+                self.dontcare_vote, self.whatabout_vote, self.slot_support, 
+                self.para_vote, self.negation_vote
         ]
         self.fixing_functions = [
                 #self.exclude_slot
@@ -99,20 +100,50 @@ class ValueVoter:
         self.woz_train_votes = self.get_woz_votes("train")
 
         self.support_regexes = {
-            "food": re.compile(r"serving ((?:\w+\s?){1,2}) food"),
-            "area": re.compile(r"(?:in )?(\w+) (?:of town|part)"),
-            "pricerange": re.compile(r"(?:(\w+) restaurant|in (the)? (\w+) "
+            "food": re.compile(r"serving ((?:\w+\s?){1,2}) (?:food)?"),
+            "area": re.compile(r"(?:in (?:the)?)?(\w+) (?:of town|part)"),
+            "pricerange": re.compile(r"(?:(\w+) restaurant|in (?:the)? (\w+) "
                 "(?:price|pricerange|price range))")
         }
+        self.support_exps = {
+            "food": lambda cand: self.soundex.sounds_like(cand, "serving")\
+                    or self.soundex.sounds_like(cand, "serve")\
+                    or self.soundex.sounds_like(cand, "serves"),
+            "area": lambda cand: self.soundex.sounds_like(cand, "part"),
+            "pricerange": lambda cand: self.soundex\
+                    .sounds_like(cand, "restaurant") or self.soundex\
+                    .sounds_like(cand, "range")
+        }
+
+        self.soundex_blacklist = ["the"]
 
         self.para_voter = ParaphrasingVoter(self.center.dataframe, self)
+
+
+    def negation_vote(self, slot):
+
+        def is_negative(x: pd.Series):
+            for asr in x.asr:
+                transc, score = asr
+                if score < ASR_THRESHOLD:
+                    return -1
+                vote, idx = self.resolve(transc, slot, return_idx=True)
+                if vote == -1 or idx == 0:
+                    continue
+                spl = transc.split()
+                if spl[idx-1] in ("no", "not") or "dont want" in spl[:idx]:
+                    return vote + 100
+            return -1
+
+        return is_negative
 
     def para_vote(self, slot):
 
         def give_para_vote(x: pd.Series):
 
             for state in self.para_voter.states:
-                if x.dial != state["dial"]:
+                if x.dial != state["dial"] or x.name != min(
+                        self.center.dataframe.query("dial == '%s'" % x.dial).index):
                     continue
                 if slot not in state["state"]:
                     return -1
@@ -133,38 +164,35 @@ class ValueVoter:
             if (asr_try := func(xcop, **kwargs)) > -1:
                 return asr_try
         return -1
+    
+    def check_soundex(self, word, slot):
+        if word in self.soundex_blacklist:
+            return -1
+        for potval in self.ontology[slot]:
+            if self.soundex.sounds_like(word, potval):
+                return self.ontology[slot].index(potval)
+        return -1
 
     def slot_support(self, slot):
 
         def support_val(x: pd.Series, real=False):
-            transc = x.transcription if not real else x.real_transcription
-            if not (match := self.support_regexes[slot].search(transc)):
-                return -1
 
-            if (hit := match.groups()[0]) not in self.ontology[slot]:
-                if not isinstance(hit, str):
+            for transc, score in x.asr:
+                if score < ASR_THRESHOLD:
                     return -1
-                if self.dontcare(slot).match(hit):
+
+                if not any([self.support_exps[slot](w) for w in transc.split()]):
+                    continue
+
+                if self.dontcare(slot).match(transc):
                     return len(self.ontology[slot])
-                return -1
 
-            words = transc.split()
-            for word_idx, word in enumerate(words):
-                if word in self.ontology[slot]:
-                    if word in self.exceptions[slot] and\
-                            word_idx < len(words) - 1 and\
-                            words[word_idx+1] in self.exceptions[slot][word]:
-                            continue
-                    vote = self.ontology[slot].index(word)
-                    return vote
-                for candidate in [
-                        word, *self.find_double_word_value(word, transc, slot)
-                ]:
-                    for val, alt_vals in self.alternatives.items():
-                        if val in self.ontology[slot] and candidate in alt_vals:
-                            vote = self.ontology[slot].index(val)
-                            return vote 
+                if (resolve_val := self.resolve(transc, slot)) > -1:
+                    return resolve_val
 
+                for w in transc.split():
+                    if (soundex_vote := self.check_soundex(w, slot)) > -1:
+                        return soundex_vote
             return -1
 
         return support_val
@@ -204,22 +232,21 @@ class ValueVoter:
 
         def vote_whatabout(x: pd.Series, real=False, cont=True):
             transc = x.transcription if not real else x.real_transcription
-
-            whatabout_regexp = re.search(
-                    r"(?:(what|how) about|is it) (\w)+",
-                    transc
-            )
-            if not whatabout_regexp:
-                if not cont: 
-                    return -1
-                
-                return self.check_asr(x, vote_whatabout, real=real, cont=False)
             
-            slot_check = slot if slot != "pricerange" else "price ?(range)?" 
-            if "any" in transc and re.search(slot_check, transc) is not None:
-                return len(self.ontology[slot])
-            ## check for phonetics etc as well maybe
-            return self.vote_for_slot(slot)(x, real=real)
+            if "what about" in transc:
+                asr_spl = transc.split()
+                about_idx = asr_spl.index("about")
+                if (resolve_vote := self.resolve(
+                    " ".join(asr_spl[about_idx:]), slot)) > -1:
+                    return resolve_vote
+                for w in asr_spl[about_idx:about_idx+3]:
+                    if (soundex_vote := self.check_soundex(w, slot)) > -1:
+                        return soundex_vote
+
+                            
+            if cont:
+                return self.check_asr(x, vote_whatabout, real=real, cont=False)
+            return -1
 
         return vote_whatabout
 
@@ -232,7 +259,7 @@ class ValueVoter:
         def dontcare_value(x: pd.Series, real=False, cont=True):
             transc = x.transcription if not real else x.real_transcription
             dc_vote = len(self.ontology[slot])
-            if self.vote_for_slot(slot)(x, real=real) > -1:
+            if self.resolve(transc, slot) > -1:
                 return -1
             if self.dontcare(slot).search(transc):
                 if x.system_transcription == self.welcome_msg:
@@ -324,7 +351,7 @@ class ValueVoter:
 
             if slot in x.transcription or \
                     (slot == "pricerange" and "price range" in x.transcription):
-                        if self.vote_for_slot(slot)(x, real=real) >= 0:
+                        if self.resolve(x.transcription, slot)>= 0:
                             # a value was stated in the slot, no need to interfere
                             return return_F 
                         # a value was specifically requested, return negative
@@ -360,12 +387,8 @@ class ValueVoter:
                 if (attempt := whole_transcript[w_idx-1:w_idx+1]) == candidate:
                     possibilities.append(" ".join(attempt))
         return possibilities
-
-    def vote_for_slot(self, slot, threshold=ASR_THRESHOLD):
-
-        def val_in_text(x: pd.Series, real=False, only_transc=None):
-
-            def resolve(transc):
+    
+    def resolve(self, transc, slot, return_idx=False):
                 if transc in self.invalids:
                     return -1
 
@@ -377,6 +400,8 @@ class ValueVoter:
                                 words[word_idx+1] in self.exceptions[slot][word]:
                                 continue
                         vote = self.ontology[slot].index(word)
+                        if return_idx:
+                            return vote, word_idx
                         return vote
                     for candidate in [
                             word, *self.find_double_word_value(word, transc, slot)
@@ -384,23 +409,31 @@ class ValueVoter:
                         for val, alt_vals in self.alternatives.items():
                             if val in self.ontology[slot] and candidate in alt_vals:
                                 vote = self.ontology[slot].index(val)
+                                if return_idx:
+                                    return vote, word_idx
                                 return vote 
-
+                if return_idx:
+                    return -1, -1
                 return -1
 
+    def vote_for_slot(self, slot, threshold=ASR_THRESHOLD):
+
+        def val_in_text(x: pd.Series, real=False, only_transc=None):
+
+            
             if only_transc:
-                return resolve(only_transc)
+                return self.resolve(only_transc, slot)
 
             if real:
-                return resolve(x.real_transcription)
+                return self.resolve(x.real_transcription, slot)
 
             candidates = {}
             for asr in x.asr:
                 transc, score = asr
                 if score < threshold:
                     break
-                result = resolve(transc)
-                if (result := resolve(transc)) > -1:
+                result = self.resolve(transc, slot)
+                if (result := self.resolve(transc, slot)) > -1:
                     if result not in candidates:
                         candidates[result] = 0
                     candidates[result] += score
@@ -425,7 +458,7 @@ class ValueVoter:
                 for asr in x.asr[1:5]:
                     xcop = x.copy()
                     xcop.transcription = asr[0]
-                    if (asr_try := self.vote_for_slot(slot)(xcop)) > -1:
+                    if (asr_try := self.resolve(xcop.transcription, slot)):
                         return asr_try
                 return -1
 
@@ -439,7 +472,7 @@ class ValueVoter:
                 return len(self.ontology[slot])
             if self.decline.search(transc):
                 return -1
-            if (attempt := self.vote_for_slot(slot)(x, real=real)) > 0:
+            if (attempt := self.resolve(transc, slot)) > -1:
                 return attempt
             return try_asr()
 
@@ -499,7 +532,7 @@ class ValueVoter:
     def accept_or_decline_val(self, x, slot, match, real=False):
         transc = x.transcription if not real else x.real_transcription
         if self.decline.search(transc):
-            if (other_val := self.vote_for_slot(slot)(x, real=real)) > 0 and other_val != match:
+            if (other_val := self.resolve(transc, slot)) > 0 and other_val != match:
                 return other_val
             return -1
         if self.accept.search(transc):
@@ -597,56 +630,47 @@ class SnorkelDialogueVoter:
     def __init__(self, center):
         self.center = center
         self.functions = [
-            #self.find_missing_val, self.keyword_found_no_val
+            self.find_missing_val, self.keyword_found_no_val
         ]
 
-        self.price_functions = [
-            #self.budget_hit
-        ]
         self.function_map = {
             "food": [],
             "area": [],
-            "pricerange": self.price_functions
+            "pricerange": [] 
         }
+
+        # turn idx -> {slot: bool} 
+        self.slot_detected_no_val = {}
+
+
+    def _detect_slot_without_val(self):
+        for row_idx, row in self.center.dataframe.iterrows():
+            self.slot_detected_no_val[row.name] = {}
+            for slot in ("food", "area", "pricerange"):
+                if len(curr_preds := self.resolve(row, slot)) > 0:
+                    self.slot_detected_no_val[row.name][slot] = False
+                    continue
+                for asr in row.asr:
+                    transc, score = asr
+                    if score < self.threshold:
+                        if slot not in self.slot_detected_no_val[row.name]:
+                            self.slot_detected_no_val[row.name][slot] = False
+                        break
+                    for w in transc.split():
+                        support_check = self.center.value_voter.support_exps[slot](w)
+                        if support_check:
+                            self.slot_detected_no_val[row.name][slot] = True
+                            break
+                if slot not in self.slot_detected_no_val[row.name]:
+                    self.slot_detected_no_val[row.name][slot] = False
+
 
     def get_functions(self, slot):
         funcs = [fn(slot) for fn in self.functions]
         funcs.extend(self.function_map[slot])
         return funcs
+
     
-    def budget_hit(self, x: pd.Series, real=False):
-        if real:
-            return -1
-        slot = "pricerange"
-
-        curr_preds = self.resolve(x, slot)
-
-        def find_keyword(transc):
-            if "budget" not in transc:
-                return []
-            
-            dial_df = self.center.dataframe.query(f"dial == '{x.dial}'")
-            row_idx = x.name - min(dial_df.index)
-            candidates = []
-            for turn_idx, turn in dial_df.iloc[row_idx+1:].iterrows():
-                if len(candidates) > 0:
-                    break
-                if len((pred := self.resolve(turn, slot))) > 0:
-                    majority = self.get_majority_from_candidates(pred, slot)
-                    if len(majority) > 0:
-                        candidates.append((turn_idx, majority[1]))
-
-            return candidates
-
-        for asr in x.asr:
-            transc, score = asr
-            if score < self.threshold:
-                break
-            if len(cand := find_keyword(transc)) > -1:
-                return cand
-        return []
-
-
     def keyword_found_no_val(self, slot, real=False):
 
         def keyword_found(x: pd.Series, real=False):
@@ -691,6 +715,12 @@ class SnorkelDialogueVoter:
         return keyword_found
     
     def find_missing_val(self, slot):
+
+        """
+        Finds a value in the ASR of a turn with a given vote that also
+        exists in a previous turn without a vote, and assumes that the previous
+        utterance should have the same vote
+        """
         
         def find_example(x: pd.Series, real=False):
             if real:
@@ -703,8 +733,11 @@ class SnorkelDialogueVoter:
             any_vote = self.resolve(x, slot)
             if len(any_vote) == 0  or (len(any_vote) > 1 and 
                     len(set([r[1] for r in any_vote])) > 1):
+                # If either no votes are casted, or votes are casted for multiple
+                # labels, ignore
                 return []
             if any_vote[0][1] == len(self.center.value_voter.ontology[slot]):
+                # Shouldnt correct dontcare
                 return []
 
             returns = []
@@ -759,19 +792,67 @@ class SnorkelDialogueVoter:
 
 class SnorkelFixingVoter:
 
+    state_file = "./restaurantstate.json"
+
     def __init__(self, center):
         self.center = center
         self.fixing_functions = [
-                #self.vote_no_last
+                self.vote_no_last, self.val_from_second
         ]
+
+        self.restaurant_states = json.load(open(self.state_file))
+
+        self.find_restaurant = re.compile(r"((?:\w\s?)+) is a (?:\w+ )?restaurant")
+        self.no_restaurant = re.compile(r"sorry there is no")
 
     def get_functions(self, slot):
         return [fn(slot) for fn in self.fixing_functions]
 
+    def val_from_second(self, slot):
+        """
+        If two+ restaurants are offered in a dialogue, and the user rejects the first one,
+        and accepts the second one, and there is some difference in the slot values, the
+        values that were used to elect the first utterance should be altered to whatever
+        matches the second
+        """
+        
+        def second_restaurant(x: pd.Series):
+            # First: detect restaurant
+            # Second: detect earlier restaurant in the dialogue
+            # Third: Make sure that it isnt just reqalts
+            # Fourth: detect difference
+            # Fifth: vote for second
+
+            if not (rest := self.find_restaurant.search(x.system_transcription)):
+                return -1
+            for row_idx, row in self.center.dataframe.query("dial == '%s'" %
+                    x.dial).iterrows():
+                if row.name >= x.name or self.no_restaurant.search(x.system_transcription):
+                    return -1
+                if not (prev_rest := self.find_restaurant.search(x.system_transcription)):
+                    continue
+                state = self.restaurant_states[rest.groups(0)[0]]
+                prev_state = self.restaurant_states[prev_rest.groups(0)[0]]
+                if state[slot] == prev_state[slot]:
+                    return -1
+                for prev_row_idx, prev_row in self.center.dataframe.query("dial == '%s'" %
+                        x.dial).iterrows():
+                    if prev_row_idx >= row_idx:
+                        return -1
+                    rel_cols = [col for col in self.center.dataframe.columns if f"{slot}_lf_" in col
+                        and "val_from_second" not in col]
+                    for col in rel_cols:
+                        if prev_row[col] != -1:
+                            return (col, prev_row[col]+100, prev_row_idx)
+
+            return -1
+
+        return second_restaurant
+
     def vote_no_last(self, slot):
         """
         Will vote against any votes cast in the final turn. Returns a list of tuples of
-        type (COL_TO_VOTE_AGAINST, VOTE_VALUE)
+        type (COL_TO_VOTE_AGAINST, VOTE_VALUE, turn_idx)
         """
 
         def last_vote_no(x: pd.Series, real=False):
@@ -783,7 +864,7 @@ class SnorkelFixingVoter:
                         and "last_vote_no" not in col]
                 for col in rel_cols:
                     if x[col] > -1:
-                        return (col, x[col] + 100)
+                        return (col, x[col] + 100, x.name)
             return -1
 
         return last_vote_no
@@ -1008,7 +1089,7 @@ class ParaphrasingApplier:
                 return state, False
         return state, True
 
-    def parse(self, transcription, dial, ontology, *args):
+    def parse(self, transcription, dial, ontology, blacklist, *args):
         """
         For an incoming transcription, go through tags and find the alternative
         with the shortest phonetic distance.
@@ -1024,21 +1105,15 @@ class ParaphrasingApplier:
                 continue
 
             parsed_state = {"dial": dial, "state": {}}
-            distances = {}
             for k,v in state.items():
                 if not v:
                     continue
                 real_val = self._find_slot_and_val(k, v, ontology, *args)
                 if not real_val:
-                    best_dist = 9999
-                    best_alt = ""
                     for ont_val in ontology[k]:
-                        if (dist := self.metric.distance(v, ont_val)) < best_dist:
-                            best_dist = dist
-                            best_alt = ont_val
-                    if best_alt and best_dist <= 1 and best_alt != "thai":
-                        distances[k] = best_dist
-                        parsed_state["state"][k] = best_alt
+                        if self.metric.sounds_like(ont_val, v) and v not in blacklist:
+                            parsed_state[k] = ont_val
+                            break
                 else:
                     parsed_state["state"][k] = real_val
 
@@ -1116,30 +1191,8 @@ class ParaphrasingTagger:
             if turn.name != min(self.df.query("dial == '%s'" % turn.dial).index):
                 continue
             attempt = applier.parse(turn.transcription, turn.dial, self.vv.ontology,
-                    self.vv.alternatives)
+                    self.vv.soundex_blacklist, self.vv.alternatives)
             if attempt is not None:
                 states.append(attempt)
-            #preds = {}
-            #attempts = []
-            #for transc, score in turn.asr:
-            #    if score < self.threshold:
-            #        break
-            #    attempt = applier.parse(transc, turn.dial, self.vv.ontology, self.vv.alternatives)
-            #    if attempt is not None:
-            #        state_repr = "¤".join(attempt["state"].values())
-            #        addition = preds[state_repr] + score if state_repr in preds else score
-            #        preds[state_repr] = addition
-            #        attempts.append(attempt)
-            #if len(preds.items()) == 0:
-            #    continue
-            #best_pred = list(sorted(preds.items(), key=lambda x: x[1], reverse=True))[0][0]
-            #right_attempt = [att for att in attempts 
-            #        if "¤".join(att["state"].values()) == best_pred][0]
-            #if len(right_attempt) == 0:
-            #    continue
-            #
-            #right_attempt["turn_no"] = turn.name - min(
-            #        self.df.query("dial == '%s'" % turn.dial).index)
-            #states.append(right_attempt)
         return states
 
