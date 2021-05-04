@@ -77,7 +77,7 @@ class ValueVoter:
         self.labeling_functions = [
                 self.vote_for_slot, self.response_vote, self.confirmation_vote,
                 self.dontcare_vote, self.whatabout_vote, self.slot_support, 
-                self.para_vote, self.negation_vote
+                self.para_vote
         ]
         self.fixing_functions = [
                 #self.exclude_slot
@@ -111,7 +111,7 @@ class ValueVoter:
                     or self.soundex.sounds_like(cand, "serves"),
             "area": lambda cand: self.soundex.sounds_like(cand, "part"),
             "pricerange": lambda cand: self.soundex\
-                    .sounds_like(cand, "restaurant") or self.soundex\
+                    .sounds_like(cand, "price") or self.soundex\
                     .sounds_like(cand, "range")
         }
 
@@ -120,22 +120,6 @@ class ValueVoter:
         self.para_voter = ParaphrasingVoter(self.center.dataframe, self)
 
 
-    def negation_vote(self, slot):
-
-        def is_negative(x: pd.Series):
-            for asr in x.asr:
-                transc, score = asr
-                if score < ASR_THRESHOLD:
-                    return -1
-                vote, idx = self.resolve(transc, slot, return_idx=True)
-                if vote == -1 or idx == 0:
-                    continue
-                spl = transc.split()
-                if spl[idx-1] in ("no", "not") or "dont want" in spl[:idx]:
-                    return vote + 100
-            return -1
-
-        return is_negative
 
     def para_vote(self, slot):
 
@@ -674,31 +658,31 @@ class SnorkelDialogueVoter:
     def keyword_found_no_val(self, slot, real=False):
 
         def keyword_found(x: pd.Series, real=False):
-            found = {
-                "food": re.compile(r"(serving \w+| \w+ food)"),
-                "area": re.compile(r"(\w+ of town|\w+ area)"),
-                "pricerange": re.compile(r"(in the )?\w+ price ?range")
-                }[slot]
+           # found = {
+           #     "food": re.compile(r"(serving \w+| \w+ food)"),
+           #     "area": re.compile(r"(\w+ of town|\w+ area)"),
+           #     "pricerange": re.compile(r"(in the )?\w+ price ?range")
+           #     }[slot]
 
             curr_preds = self.resolve(x, slot)
             if len(curr_preds) > 0:
                 return []
 
             def check_for_transc(transc):
-                if not found.search(transc):
+                
+                if len(transc) == 0:
+                    return []
+                if not self.center.value_voter.support_exps[slot](transc):
                     return []
                 # find first occuring slot value for slot
                 dial_df = self.center.dataframe.query(f"dial == '{x.dial}'")
                 row_idx = x.name - min(dial_df.index)
-                candidates = []
-                for turn_idx, turn in dial_df.iloc[row_idx+1:].iterrows():
-                    if len(candidates) > 0:
-                        break
+                for turn_idx, turn in dial_df.loc[row_idx+1:].iterrows():
                     if len((pred := self.resolve(turn, slot))) > 0:
                         majority = self.get_majority_from_candidates(pred, slot)
                         if len(majority) > 0:
-                            candidates.append((turn_idx, majority[1]))
-                return candidates
+                            return [(x.name, majority[1])]
+                return []
 
             if real:
                 return check_for_transc(x.real_transcription)
@@ -741,7 +725,7 @@ class SnorkelDialogueVoter:
                 return []
 
             returns = []
-            for _, row in dial_df.iloc[:row_idx].iterrows():
+            for _, row in dial_df.loc[:row_idx].iterrows():
                 candidates = FreqDist()
                 any_cast = self.resolve(row, slot)
                 if len(any_cast) > 0:
@@ -755,9 +739,9 @@ class SnorkelDialogueVoter:
                             candidates[w] += 1
                 if len(candidates) == 0:
                     continue
-                returns.append((row.name, any_vote[0][1]))
+                return [(row.name, any_vote[0][1])]
 
-            return returns
+            return []
 
         return find_example 
 
@@ -797,7 +781,7 @@ class SnorkelFixingVoter:
     def __init__(self, center):
         self.center = center
         self.fixing_functions = [
-                self.vote_no_last, self.val_from_second
+                #self.vote_no_last, self.val_from_second, negation_vote
         ]
 
         self.restaurant_states = json.load(open(self.state_file))
@@ -807,6 +791,77 @@ class SnorkelFixingVoter:
 
     def get_functions(self, slot):
         return [fn(slot) for fn in self.fixing_functions]
+
+    def exclude_func(self, slot):
+
+        def exclude_if_ask(x: pd.Series):
+
+            rel_cols = [col for col in self.center.dataframe.columns if f"{slot}_lf_" in col
+                    and "exclude_if_ask" not in col]
+            dial_df = self.center.dataframe.query("dial == '%s'" % x.dial)
+
+            for asr in x.asr:
+                transc, score = asr
+                if score < ASR_THRESHOLD:
+                    return -1
+                if not (hit := self.center.value_voter.suggest_option.match(
+                    x.system_transcription)):
+                    continue
+                area_type, food_type, price_type = hit.groups()
+                food_split = food_type.split() if food_type else []
+                if food_type is not None and\
+                        len(food_split) > 2 and\
+                        food_split[0] in ("cheap", "moderate", "expensive"):
+                            price_type = food_split[0]
+                
+                if slot == "food":
+                    right_val = food_type
+                elif slot == "area":
+                    right_val = area_type
+                else:
+                    right_val = price_type
+
+                if right_val is None:
+                    continue
+
+                if self.center.value_voter.decline.search(transc) and len(
+                        [x for x in [food_type, area_type, price_type] if x]
+                ) > 1:
+                    for row_idx, row in dial_df.iterrows():
+                        if row_idx == x.name:
+                            return -1
+
+                        for col in rel_cols:
+                            if len(self.center.ontology[slot])+1 > row[col] > -1:
+                                return (col, row[col] + 100, row_idx)
+                                
+                    
+            return -1
+                    
+        return exclude_if_ask
+
+
+
+    def negation_vote(self, slot):
+
+        def is_negative(x: pd.Series):
+            rel_cols = [col for col in self.center.dataframe.columns if f"{slot}_lf_" in col
+                    and "negation_vote" not in col]
+            for col in rel_cols:
+                if len(self.center.ontology[slot])+1 > x[col] > -1:
+                    for asr in x.asr:
+                        transc, score = asr
+                        if score < ASR_THRESHOLD:
+                            return -1
+                        vote, idx = self.center.value_voter.resolve(transc, slot,
+                                return_idx=True)
+                        if vote == -1 or idx == 0:
+                            continue
+                        spl = transc.split()
+                        if spl[idx-1] in ("no", "not") or "dont want" in spl[:idx]:   
+                            return (col, x[col] + 100, x.name)
+            return -1
+        return is_negative
 
     def val_from_second(self, slot):
         """
