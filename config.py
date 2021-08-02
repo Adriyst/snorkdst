@@ -10,9 +10,9 @@ CONFIG = {
         "SENT_MAX_LEN": 180,
         "BERT_VERSION": "bert-base-uncased",
         "NUM_EPOCHS": 30,
-        "TRAIN_BATCH_SIZE": 2,
+        "TRAIN_BATCH_SIZE": 16,
         "LEARN_RATE": 2e-5,
         "DROPOUT": 0.3,
-        "ASR_HYPS": 5
+        "ASR_HYPS": 1
     }
 }

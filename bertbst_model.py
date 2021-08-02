@@ -4,17 +4,15 @@ from torch.optim import Adam
 from torch.cuda import is_available
 from transformers import BertTokenizer, BertModel
 
-from nltk import FreqDist, ConditionalFreqDist, bigrams
+from nltk import FreqDist
 import random
 from copy import deepcopy
 import logging
-import pickle
 import json
 import os 
 import numpy as np
 from tqdm import tqdm
 import numpy as np
-from pylev import levenshtein as distance
 
 import dataset_dstc2
 import tokenization
@@ -234,9 +232,6 @@ class DataLoader:
             
             word_idxs, inp_ids, mask, seg_ids = get_bert_input(tokens_a, tokens_b, 
                     CONFIG["MODEL"]["SENT_MAX_LEN"], self.tokenizer)
-            #print(turn.guid)
-            #print(word_idxs)
-            #input()
             input_ids.append(inp_ids)
             masks.append(mask)
             types.append(seg_ids)
@@ -373,6 +368,7 @@ class BertNet(nn.Module):
 
                 loss.backward()
                 self.optim.step()
+                break
             logger.info("Position loss for epoch: %s" % epoch_pos_loss)
             logger.info("Class loss for epoch: %s" % epoch_class_loss)
             logger.info("Dev loss:")
@@ -475,54 +471,53 @@ class BertNet(nn.Module):
         tot_corrs = {}
 
         for slot, preds in slot_preds.items():
-            print("For slot", slot)
+            logger.info("For slot %s" % slot)
             tot_corr, class_corr, pos_corr = get_joint_slot_correctness(preds,
                     ignore_file=True)
             tot_corrs[slot] = tot_corr
             joint_acc *= tot_corr
-            print("total correct:", np.mean(tot_corr))
-            print("class correct:", np.mean(class_corr))
-            print("pos correct", np.mean(pos_corr))
+            logger.info("total correct: %s" % np.mean(tot_corr))
+            logger.info("class correct: %s" % np.mean(class_corr))
+            logger.info("pos correct %s" % np.mean(pos_corr))
         
         if watch_param:
             where_wrong = np.where(joint_acc == 0)[0]
             for num_idx, wrong_idx in enumerate(where_wrong):
                 turn = predset[wrong_idx]
                 guid = turn.guid
-                print("For turn with guid", guid)
-                print(" ".join(turn.text_a))
-                print(" ".join(turn.text_b))
-                print("_"*30)
-                print("Predictions:")
+                logger.info("For turn with guid %s" % guid)
+                logger.info(" ".join(turn.text_a))
+                logger.info(" ".join(turn.text_b))
+                logger.info("_"*30)
+                logger.info("Predictions:")
                 for slot in self.slots:
                     gt_slot = "price range" if slot == "pricerange" else slot
                     gt_cls = self._dst_slot_map()[turn.class_label[gt_slot]]
                     pred_cls = all_pred_info[guid][slot]["class"]
-                    print("¤"*30)
-                    print("For slot", slot, "with pred class",
-                            pred_cls, "and ground truth", gt_cls)
-                    print("With result", tot_corrs[slot][wrong_idx])
+                    logger.info("¤"*30)
+                    logger.info("For slot %s with pred class %s and ground truth %s" % (slot, pred_cls, gt_cls))
+                    logger.info("With result %s" % tot_corrs[slot][wrong_idx])
                     if gt_cls != pred_cls:
-                        print("Wrong class prediction, no idx needed")
+                        logger.info("Wrong class prediction, no idx needed")
                         continue
                     if gt_cls != 2:
                         prev_wrong_idx = where_wrong[num_idx-1]
                         prev_wrong_guid = predset[prev_wrong_idx].guid
                         if prev_wrong_guid == guid and tot_corrs[slot][prev_wrong_idx] == 0:
-                            print("Carried over bad label from previous turn.")
+                            logger.info("Carried over bad label from previous turn.")
                             continue
                             
-                        print("No idx, got it right")
+                        logger.info("No idx, got it right")
                         continue
-                    print("real idx:", all_pred_info[guid][slot]["gt_first"], 
+                    logger.info("real idx:", all_pred_info[guid][slot]["gt_first"], 
                             all_pred_info[guid][slot]["gt_second"])
-                    print("pred_idxs:", all_pred_info[guid][slot]["first"],
+                    logger.info("pred_idxs:", all_pred_info[guid][slot]["first"],
                             all_pred_info[guid][slot]["second"])
-                    print("_"*30)
-                print("#"*30)
+                    logger.info("_"*30)
+                logger.info("#"*30)
                 input()
         joint_acc = np.mean(joint_acc)
-        print("Joint accuracy:", joint_acc)
+        logger.info("Joint accuracy: %s" % joint_acc)
 
 
     
@@ -700,8 +695,8 @@ class PredictionSet:
         try:
             vals[sec_idx] = 1
         except IndexError:
-            print("wtf")
-            print(sec_idx)
+            logger.info("wtf")
+            logger.info(sec_idx)
         return vals
 
     def pred_idx(self, cat, idx):
@@ -845,13 +840,13 @@ if __name__ == '__main__':
             for ep in range(CONFIG["MODEL"]["NUM_EPOCHS"]):
                 if not\
                     os.path.exists(f'{CONFIG["MODEL"]["MODEL_DIR"]}bertdst-light-{dataset}-{ep}.pt'):
-                        print("FINISHED AT EPOCH ", ep)
+                        logger.info("FINISHED AT EPOCH ", ep)
                         sys.exit(0)
 
-                print("For model # %s" % ep)
+                logger.info("For model # %s" % ep)
                 load_model_state(bn, dataset, ep)
                 bn.predict(mode=mode, watch_param=args.log, weighted=args.weighted)
     else:
-        print("Mode must be either train, validate, or test")
+        logger.info("Mode must be either train, validate, or test")
         sys.exit(1)
 
