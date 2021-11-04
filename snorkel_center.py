@@ -31,7 +31,7 @@ class SnorkelCenter:
                 "val_in_text", "val_in_response", "val_in_request",
                 "dontcare_value", "vote_whatabout", "dontcare_x",
                 "support_val", "give_para_vote", "find_example",
-                "keyword_found"
+                "keyword_found", "is_negative", #"woz_label"
         ]
         base_funcs = self.func_order.copy()
         self.func_order.extend([f"{x}_last_vote_no" for x in base_funcs])
