@@ -17,9 +17,7 @@ ASR_THRESHOLD = .10
 
 class ValueVoter:
 
-    WOZ_PATHS = {
-        "train": "./woz_train_votes.json"
-    }
+    WOZ_PATH = "./woz_votes.json"
 
     def __init__(self, center):
         self.ontology = center.ontology if center else\
@@ -97,7 +95,7 @@ class ValueVoter:
                 )
 
         self.exceptions = self.slot_exceptions()
-        self.woz_train_votes = self.get_woz_votes("train")
+        #self.woz_train_votes = json.load(open(self.WOZ_PATH))
 
         self.support_regexes = {
             "food": re.compile(r"serving ((?:\w+\s?){1,2}) (?:food)?"),
@@ -271,15 +269,33 @@ class ValueVoter:
         return dontcare_value
 
     def woz_label_func(self, slot):
-        woz = self.get_woz("train", slot)
         
         def woz_label(x: pd.Series):
-            return woz[x.name]
+            vote = self.get_woz(slot, x)
+            return self.ontology[slot].index(vote) if (vote and vote in
+                    self.ontology[slot]) else -1
 
         return woz_label
+
+    def get_woz(self, slot, x: pd.Series):
+        turn_no = x.name - min(self.center.dataframe.query("dial == '%s'" % x.dial).index)
+        right_turn = [t for t in self.woz_train_votes[x.dial]
+                if t["turn_no"] == str(turn_no)]
+        if len(right_turn) == 0:
+            print()
+            print()
+            print()
+            print()
+            print(x.name)
+            print(x.dial)
+            print(turn_no)
+        right_turn = right_turn[0]
+        s = slot if slot != "pricerange" else "price range"
+        return right_turn[s]
+
         
 
-    def get_woz(self, mode, slot):
+    def DEPR_get_woz(self, mode, slot):
         if mode == "train":
             return self.woz_train_votes[slot]
 
@@ -579,31 +595,34 @@ class ValueVoter:
             "area": [],
             "pricerange": []
         }
-        for turn in voteset:
-            for slotname, slotval in turn.items():
-                if slotname == "price range":
-                    slotname = "pricerange"
-                if slotval == "":
-                    votes[slotname].append(-1)
-                    continue
-                if slotval == "dontcare":
-                    votes[slotname].append(len(self.ontology[slotname]))
-                    continue
-                if slotval in self.ontology[slotname]:
-                    votes[slotname].append(
-                            self.ontology[slotname].index(slotval)
-                    )
-                    continue
-                added = False
-                for alt, alt_vals in self.alternatives.items():
-                    if slotval in alt_vals and alt in self.ontology[slotname]:
-                        added = True
+        for dial in voteset.values():
+            for turn in sorted(dial, key=lambda x:x["turn_no"]):
+                for slotname, slotval in turn.items():
+                    if slotname == "turn_no":
+                        continue
+                    if slotname == "price range":
+                        slotname = "pricerange"
+                    if slotval == "":
+                        votes[slotname].append(-1)
+                        continue
+                    if slotval == "dontcare":
+                        votes[slotname].append(len(self.ontology[slotname]))
+                        continue
+                    if slotval in self.ontology[slotname]:
                         votes[slotname].append(
-                                self.ontology[slotname].index(alt)
+                                self.ontology[slotname].index(slotval)
                         )
-                        break
-                if not added:
-                    votes[slotname].append(-1)
+                        continue
+                    added = False
+                    for alt, alt_vals in self.alternatives.items():
+                        if slotval in alt_vals and alt in self.ontology[slotname]:
+                            added = True
+                            votes[slotname].append(
+                                    self.ontology[slotname].index(alt)
+                            )
+                            break
+                    if not added:
+                        votes[slotname].append(-1)
         return votes
 
 
@@ -614,7 +633,7 @@ class SnorkelDialogueVoter:
     def __init__(self, center):
         self.center = center
         self.functions = [
-            self.find_missing_val, self.keyword_found_no_val
+            #self.find_missing_val, self.keyword_found_no_val
         ]
 
         self.function_map = {
@@ -781,10 +800,9 @@ class SnorkelFixingVoter:
     def __init__(self, center):
         self.center = center
         self.fixing_functions = [
-                #self.vote_no_last, self.val_from_second, negation_vote
         ]
 
-        self.restaurant_states = json.load(open(self.state_file))
+        #self.restaurant_states = json.load(open(self.state_file))
 
         self.find_restaurant = re.compile(r"((?:\w\s?)+) is a (?:\w+ )?restaurant")
         self.no_restaurant = re.compile(r"sorry there is no")

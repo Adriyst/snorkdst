@@ -162,7 +162,7 @@ def create_examples(dialog_filename, slot_list, set_type, use_asr_hyp=0,
 
       usr_utt_tok_list = []
       if use_asr_hyp == 0:
-        usr_utt_tok_list.append(tokenize(turn['transcript']))
+        usr_utt_tok_list.append((tokenize(turn['transcript']), 1.0))
       else:
         for asr_hyp, asr_score in turn['asr'][:use_asr_hyp]:
             usr_utt_tok_list.append((tokenize(asr_hyp), asr_score))

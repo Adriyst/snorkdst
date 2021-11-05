@@ -4,26 +4,27 @@ from torch.optim import Adam
 from torch.cuda import is_available
 from transformers import BertTokenizer, BertModel
 
-from nltk import FreqDist, ConditionalFreqDist, bigrams
+from nltk import FreqDist, ConditionalFreqDist
 import random
+import math
 from copy import deepcopy
 import logging
-import pickle
 import json
 import os 
 import numpy as np
-#from Levenshtein import distance
-# need pure python package for saga
-from pylev import levenshtein
-distance = levenshtein
+from tqdm import tqdm
+from frozendict import frozendict
+import re
 
 import dataset_dstc2
 import tokenization
-from dst_util import tokenize_text_and_label, get_token_label_ids, get_start_end_pos
+from dst_util import (
+        tokenize_text_and_label, get_token_label_ids, get_start_end_pos,
+        get_bert_input
+)
 from get_data import DataFetcher
-
-BERT_VOCAB_LOC = "/usr/local/Development/bert/vocab.txt"
-MODEL_DIR = "/run/media/adriantysnes/HDD/models/"
+from config import CONFIG
+from metric_bert_dst import get_joint_slot_correctness
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,6 @@ SEMANTIC_DICT = {
 
 class PrePrepped:
 
-    BASE_PATH = "/usr/local/Development/master/data/clean/"
     SLOTS = ["area", "food", "price range"]
     
     def __init__(self):
@@ -96,8 +96,85 @@ class PrePrepped:
         self.test_set = None
         self.majority_set = None
         self.majority_pattern_matching_set = None
+        self.majority_test_set = None
+        self.majority_validate_set = None
         self.snorkel_set = None
         self.snorkel_pattern_matching_set = None
+        self.snorkel_test_set = None
+        self.snorkel_validate_set = None
+
+    def compare_sets(*args) -> ({str:[int]}, [int]):
+        return BertNet.report_predict(*args)
+
+    def generate_comparison(self, version) -> {str: [int]}:
+        """
+        Compare a labeled set to the gold labels.
+        version should be some iteration of x_y, where
+        x is the aggregation method - "test", "majority", "snorkel"
+        y is the set - "train", "validation", "snorkel"
+        """
+        gold_version = "test" if "test" in version else "validate"
+        gold_set = self.fetch_set(gold_version, use_asr_hyp=1, exclude_unpointable=False)
+        comp_set = self.fetch_set(version, use_asr_hyp=1, exclude_unpointable=False)
+        preds = {"food": [], "area": [], "price range": []}
+        for dial in tqdm(set(["-".join(x.guid.split("-")[:-1]) for x in gold_set])):
+            for comp_turn, gold_turn in zip(
+                self.get_turns_for_guid(dial, comp_set),
+                self.get_turns_for_guid(dial, gold_set)
+            ):
+                for slot in preds:
+                    preds[slot].append(
+                            self.get_pred_of_turn(gold_turn, comp_turn, slot)
+                    )
+        return preds
+
+    @staticmethod
+    def get_pred_of_turn(gold_turn, comp_turn, slot):
+        return {
+            "guid": gold_turn.guid,
+            "slot": slot,
+            "class_label_id": BertNet._dst_slot_map()[gold_turn.class_label[slot]],
+            "class_prediction": PrePrepped.resolve_slotval(comp_turn, slot),
+            "start_pos": PrePrepped.resolve_pos(
+                min, gold_turn.text_a_label[slot], gold_turn.text_b_label[slot]
+            ),
+            "start_prediction": PrePrepped.resolve_pos(
+                min, comp_turn.text_a_label[slot], comp_turn.text_b_label[slot]
+            ),
+            "end_pos": PrePrepped.resolve_pos(
+                max, gold_turn.text_a_label[slot], gold_turn.text_b_label[slot]
+            ),
+            "end_prediction": PrePrepped.resolve_pos(
+                max, comp_turn.text_a_label[slot], comp_turn.text_b_label[slot]
+            )
+        }
+
+    @staticmethod
+    def resolve_pos(fn, *args):
+        try:
+            return fn(PrePrepped._resolve_pos(*args))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _resolve_pos(a_preds: [int], b_preds: [int]) -> int:
+        to_use = a_preds if sum(a_preds) > 0 else b_preds
+        to_use = np.asarray(to_use)
+        return np.where(to_use == 1)[0]
+
+    @staticmethod
+    def resolve_slotval(turn, slot):
+        pred = BertNet._dst_slot_map()[turn.class_label[slot]]
+        return pred if pred < 3 else 0
+
+
+    @staticmethod
+    def get_turns_for_guid(guid, turns):
+        """
+        guid: x-n where x denotes set, n denotes dial idx
+        turns: set from which turns should be got
+        """
+        return [t for t in turns if "-".join(t.guid.split("-")[:-1]) == guid]
 
     def fetch_set(self, version, **kwargs):
         loaded_map = {
@@ -106,8 +183,12 @@ class PrePrepped:
             "test": self.test_set,
             "majority": self.majority_set,
             "majority_pattern_matching": self.majority_pattern_matching_set,
+            "majority_test": self.majority_test_set,
+            "majority_validate": self.majority_validate_set,
             "snorkel": self.snorkel_set,
-            "snorkel_pattern_matching": self.snorkel_pattern_matching_set
+            "snorkel_pattern_matching": self.snorkel_pattern_matching_set,
+            "snorkel_test": self.snorkel_test_set,
+            "snorkel_validate": self.snorkel_validate_set
         }
         relevant_set = loaded_map[version]
         if relevant_set:
@@ -116,18 +197,25 @@ class PrePrepped:
         mode_map = {
             "train": "train",
             "validate": "dev",
-            "test": "test"
+            "test": "test",
+            "majority_test": "test",
+            "snorkel_test": "test",
+            "majority_validate": "dev",
+            "snorkel_validate": "dev"
         }
         version_type = mode_map[version] if version in mode_map else mode_map["train"]
         loaded_set = dataset_dstc2.create_examples(
-            os.path.join(self.BASE_PATH, f"dstc2_{version}_en.json"),
-            self.SLOTS, version_type, **kwargs
+            os.path.join(CONFIG["MODEL"]["DATASETPATH"], f"dstc2_{version}_en.json"),
+                self.SLOTS, version_type, **kwargs
         )
         grouped_set = self._group_set(loaded_set)
         loaded_map[version] = grouped_set
         return grouped_set
 
     def _group_set(self, example_set):
+        """
+        Group the dataset into representations of multiple ASR in single turns.
+        """
         grouping = {}
         all_ex = []
         curr_guid = ""
@@ -150,150 +238,197 @@ class GroupedFeatures:
             self.guid = self.group[0].guid
             self.text_a = self.group[0].text_a
             self.text_a_label = self.group[0].text_a_label
-            self.text_b, self.text_b_label = self.find_pointed_asr()
             self.class_label = self.group[0].class_label
             self.asrs = [x.asr_score for x in self.group]
+            self.text_b, self.text_b_label, self.text_idx = self.find_pointed_asr(self.asrs)
             self.all_texts = [x.text_b for x in self.group]
             self.session_id = self.group[0].session_id
 
 
-    def find_pointed_asr(self):
-        for ex in self.group:
+    def find_pointed_asr(self, asrs):
+        for i, ex in enumerate(self.group):
+            if asrs[i] < CONFIG["MODEL"]["ASR_THRESHOLD"] or i > CONFIG["MODEL"]["ASR_HYPS"]:
+                break
             for idx_labeling in (ex.text_b_label, ex.text_a_label):
                 if any(idx_labeling):
-                    return ex.text_b, ex.text_b_label
-        return (self.group[0].text_b, self.group[0].text_b_label) \
-                if len(self.group) > 0 else ([], [])
+                    return ex.text_b, ex.text_b_label, i
+        return (self.group[0].text_b, self.group[0].text_b_label, 0) \
+                if len(self.group) > 0 else ([], [], 0)
 
 
 
 class DataLoader:
 
+    UNK_TOKEN = "[UNK]"
+
     def __init__(self):
         self.tokenizer = tokenization.FullTokenizer(
-                vocab_file=BERT_VOCAB_LOC,
+                vocab_file = CONFIG["MODEL"]["BERT_VOCAB_LOC"],
                 do_lower_case=True
         )
 
-    def fetch_batch(self, dataset, bsize, *args):
+    def fetch_batch(self, dataset, bsize, *args, **kwargs):
         for batch in range(0, len(dataset), bsize):
             if batch + bsize > len(dataset):
-                yield self.produce_batchset(dataset[batch:], *args)
+                yield self.produce_batchset(dataset[batch:], *args, **kwargs)
             else:
-                yield self.produce_batchset(dataset[batch:batch+bsize], *args)
+                yield self.produce_batchset(dataset[batch:batch+bsize], *args, **kwargs)
         
 
-    def produce_batchset(self, turns, slots, bert_tokenizer):
-        max_len = 80
+    def get_tokens_and_labels(self, turn, slot, skip_vals=False, **kwargs):
+        tokens_a, token_labels_a = tokenize_text_and_label(
+                turn.text_a, turn.text_a_label, slot, self.tokenizer, **kwargs
+        )
+        tokens_b, token_labels_b = tokenize_text_and_label(
+                turn.text_b, turn.text_b_label, slot, self.tokenizer, **kwargs
+        )
+        token_label_ids = get_token_label_ids(
+                token_labels_a, token_labels_b, CONFIG["MODEL"]["SENT_MAX_LEN"]
+        )
+
+        if len(tokens_b) == 0:
+            tokens_b.append("[UNK]")
+
+        if skip_vals:
+            return (tokens_a, tokens_b)
+    
+        startvals, endvals = get_start_end_pos(
+            turn.class_label[slot], token_label_ids, CONFIG["MODEL"]["SENT_MAX_LEN"]
+        )
+
+        
+        return (tokens_a, tokens_b, startvals, endvals)
+
+
+    def produce_batchset(self, turns, slots, bert_tokenizer, pred=False, **kwargs):
         input_ids, masks, types, labels = [], [], [], []
         food_labels, area_labels, price_labels = [], [], []
+        text_indexes = []
         starts = {k: [] for k in slots}
         ends = deepcopy(starts)
-        class_types = ["none", "dontcare", "copy_value"]
+        class_types = {
+                "none": 0,
+                "dontcare": 1,
+                "copy_value": 2,
+                "unpointable": 3
+        }
         turn_based_bert = {}
         for turn in turns:
             class_label_id_dict = {}
             for slot in ["food", "area", "price range"]:
-                tokens_a, token_labels_a = tokenize_text_and_label(
-                        turn.text_a, turn.text_a_label, slot, self.tokenizer 
-                )
-                tokens_b, token_labels_b = tokenize_text_and_label(
-                        turn.text_b, turn.text_b_label, slot, self.tokenizer 
-                )
-                token_label_ids = get_token_label_ids(
-                        token_labels_a, token_labels_b, max_len
-                )
-                class_label_id_dict[slot] = class_types.index(turn.class_label[slot])
-
-                startvals, endvals = get_start_end_pos(
-                    turn.class_label[slot], token_label_ids, max_len
-                )
-                if len(tokens_b) == 0:
-                    tokens_b.append("[UNK]")
-
-                bert_tok = bert_tokenizer.encode_plus(tokens_a, tokens_b,
-                        padding='max_length', max_length=80)
-                
+                class_label_id_dict[slot] = class_types[turn.class_label[slot]]
+                tokens_a, tokens_b, startvals, endvals = self.get_tokens_and_labels(turn,
+                        slot, **kwargs)
                 if slot == "price range":
                     slot = "pricerange"
                 starts[slot].append(startvals)
                 ends[slot].append(endvals)
+            
+            word_idxs, inp_ids, mask, seg_ids = get_bert_input(tokens_a, tokens_b, 
+                    CONFIG["MODEL"]["SENT_MAX_LEN"], self.tokenizer)
+            input_ids.append(inp_ids)
+            masks.append(mask)
+            types.append(seg_ids)
 
-            input_ids.append(bert_tok["input_ids"])
-            masks.append(bert_tok["attention_mask"])
-            types.append(bert_tok["token_type_ids"])
-
+            text_indexes.append(turn.text_idx)
 
             for lab, lablist in zip(class_label_id_dict.values(), 
                     [food_labels, area_labels, price_labels]):
                 lablist.append(lab)
 
             labels.append(turn.class_label)
-            turn_based_bert[turn.guid] = self._sort_asr(turn, bert_tokenizer) 
+            turn_based_bert[turn.guid] = self._sort_asr(turn, **kwargs)
 
         return FeatureBatchSet(input_ids, masks, types, starts, ends, food_labels,
-                area_labels, price_labels, turn_based_bert)
+                               area_labels, price_labels, turn_based_bert, text_indexes, pred=pred)
 
-    def _sort_asr(self, turn, bt):
+    def _sort_asr(self, turn, **kwargs):
         all_feats = {"input_ids": [], "attention_mask": [], "token_type_ids": []}
         all_asrs = []
+        real_text_b = turn.text_b
         for txt, asr in zip(turn.all_texts, turn.asrs):
             if len(txt) == 0:
-                txt.append("[UNK]")
-            berted = bt.encode_plus(turn.text_a, txt,
-                    padding='max_length', max_length=80)
-            for k,v in berted.items():
-                all_feats[k].append(v)
+                txt.append(self.UNK_TOKEN)
+            turn.text_b = txt
+            tokens_a, tokens_b = self.get_tokens_and_labels(
+                turn, "food", skip_vals=True, **kwargs)
+            _, inp_ids, mask, seg_ids = get_bert_input(tokens_a, tokens_b, 
+                                                       CONFIG["MODEL"]["SENT_MAX_LEN"],
+                                                       self.tokenizer)
+            all_feats["input_ids"].append(inp_ids)
+            all_feats["attention_mask"].append(mask)
+            all_feats["token_type_ids"].append(seg_ids)
             all_asrs.append(asr)
+        turn.text_b = real_text_b
         return all_feats, all_asrs
 
+    
+class BertIndex:
+
+    PATH = "./all_embs.npy"
+
+    def __init__(self):
+        self.embeddings = np.load(BertIndex.PATH).item()
+
+    def __call__(self, words: [int]):
+        return check_cuda_stack_float([self[idx] for idx in words])
+
+    def __getitem__(self, idx):
+        return check_cuda_float(torch.from_numpy(self.embeddings[idx]))
+
+class BertIndex_OLD:
+
+    TRAIN_SIZE = 1611
+
+    def __init__(self):
+        self.curr_perc = 1
+        self.curr_mode = "train"
+        self.load_vectors("train")
+
+    def get_features_from_batch(self, guids: [str]):
+        return [self.get_features(guid) for guid in guids]
+
+    def get_features(self, guid: str):
+
+        try:
+            return self.vectors[f"{guid}_seq"], self.vectors[f"{guid}_comb"]
+        except KeyError:
+            self.curr_perc += 1
+            self.load_vectors(guid.split("-")[0])
+        return self.vectors[f"{guid}_seq"], self.vectors[f"{guid}_comb"]
+
+    def load_vectors(self, mode):
+        mode = mode if mode != "dev" else "validate"
+        if mode != self.curr_mode:
+            self.curr_perc = 1
+            self.curr_mode = mode
+        path = f"{CONFIG['VECTORS']}{mode}/{self.curr_perc}/features.npz"
+        self.vectors = np.load(path)
 
 class BertNet(nn.Module):
-
-    #BERT_VERSION = "bert-base-uncased"
-    BERT_VERSION = "prajjwal1/bert-medium"
 
     def __init__(self):
         super().__init__()
         self.preprep = PrePrepped()
         self.loader = DataLoader()
-        self.tokenizer = BertTokenizer.from_pretrained(self.BERT_VERSION)
-        self.bert = BertModel.from_pretrained(self.BERT_VERSION)
+        self.device = "cuda" if is_available() else "cpu"
+        self.is_cuda = self.device == "cuda"
+        self._setup_bert()
         emb_dim = self.bert.get_input_embeddings().embedding_dim
         self.emb_dim = emb_dim
-        self.food_a = nn.Linear(emb_dim, 3)
-        self.area_a = nn.Linear(emb_dim, 3)
-        self.price_a = nn.Linear(emb_dim, 3)
-
-        self.alphabeta_food = nn.Linear(emb_dim, 2)
-        self.alphabeta_area = nn.Linear(emb_dim, 2)
-        self.alphabeta_price = nn.Linear(emb_dim, 2)
-
-        self.activation = nn.Sigmoid()
-        self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(p=0.3)
-        self.loss_fn = nn.CrossEntropyLoss()
-
-        if is_available():
-            self.bert.cuda()
-            self.food_a.cuda()
-            self.area_a.cuda()
-            self.price_a.cuda()
-            self.alphabeta_food.cuda()
-            self.alphabeta_area.cuda()
-            self.alphabeta_price.cuda()
-            self.softmax.cuda()
-            self.loss_fn.cuda()
-
-        self.optim = Adam(self.parameters(), lr=2e-5)
-
-        self.epochs = 30
-        self.train_bsize = 8
+        self._setup_layers()
+        self._setup_loss_activation()
+        #self.bert_index = BertIndex()
+        self.cache = {}
 
         self.slots = ["food", "area", "pricerange"]
         self.ontology = DataFetcher.fetch_dstc_ontology()["informable"]
-        
+
     def get_relevant_results(self, batch, predset, slot_name):
+        """
+        Position loss should only be calculated for those indexes where 
+        both the prediction and the ground truth is 2, i.e. slot detected.
+        """
         true_slot_idx = batch.idx_for_cat(slot_name)
         pred_slot_idx = predset.pred_idx(slot_name, true_slot_idx)
         num_slot = pred_slot_idx.size(0)
@@ -301,406 +436,473 @@ class BertNet(nn.Module):
         first, second = predset.pos_preds(slot_name, pred_slot_idx)
         return num_slot, first, second, pred_slot_idx
 
-    def fit(self, mode="train"):
+    def get_pos_loss(self, predset, batch, slot_name):
+        """
+        Calculate the position loss for some predictions for a batch given a slot name.
+        Should amount to 20% of the loss, 10% for each position.
+        """
+        num_slot, first_preds, second_preds, pred_slot_idx = \
+            self.get_relevant_results(batch, predset, slot_name)
+        
+        first_preds, second_preds = predset.pos_preds(slot_name,
+                pred_slot_idx)
+
+        first_position_loss = self.pos_loss_fn(
+                first_preds, batch.cat_map[slot_name]["first"][pred_slot_idx]
+        ) * .1
+        first_position_loss[torch.isnan(first_position_loss)] = 0
+        second_position_loss = self.pos_loss_fn(
+                second_preds, batch.cat_map[slot_name]["second"][pred_slot_idx]
+        ) * .1
+        second_position_loss[torch.isnan(second_position_loss)] = 0
+        return first_position_loss, second_position_loss, num_slot
+
+    def get_cls_loss(self, predset, batch, slot_name):
+        """
+        Class loss should account for 80% of the loss. Returns 0 loss if there 
+        are no entries in the batch with class = 2.
+        """
+        try:
+            class_loss = self.cl_loss_fn(
+                    predset.cat_map[slot_name]["class"],
+                    batch.cat_map[slot_name]["class"]
+            ) * .8
+        except ValueError:
+            class_loss = check_cuda_float([0])
+        return class_loss
+
+    def fit(self, mode="train", continue_from=0, watch_param=False, **kwargs):
 
         best_acc = 0
 
-        dataset = self.preprep.fetch_set(mode, use_asr_hyp=5)
+        dataset = self.preprep.fetch_set(mode, 
+                use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"]
+        )
+        bsize = CONFIG["MODEL"]["TRAIN_BATCH_SIZE"]
         
-        for epoch in range(self.epochs):
+        for epoch in range(continue_from, CONFIG["MODEL"]["NUM_EPOCHS"]):
             batch_generator = self.loader.fetch_batch(
                     dataset,
-                    self.train_bsize, self.slots, self.tokenizer
+                    bsize, self.slots, self.tokenizer, slot_value_dropout=0
             )
             self.train()
             self.bert.train()
             logger.info("Starting epoch # %s" % (epoch + 1))
             epoch_class_loss, epoch_pos_loss = 0, 0
-            tralse = True
             partition = 0
             prevlisted = 10
             for batch in batch_generator:
-                partition += round((self.train_bsize/len(dataset))*100, 3)
+                partition += round((bsize/len(dataset))*100, 3)
                 if partition > prevlisted:
                     logger.info(f"{prevlisted}% of dataset processed")
                     prevlisted += 10 
                 self.zero_grad()
-                class_logits, pos_logits = self(batch)
+                class_logits, pos_logits = self(batch, **kwargs)
                 predset = PredictionSet(*class_logits, *pos_logits)
-
                 loss = 0
                 for slot_name in predset.categories:
-                    num_slot, first_preds, second_preds, pred_slot_idx = \
-                            self.get_relevant_results(batch, predset, slot_name)
-                    
-                    first_preds, second_preds = predset.pos_preds(slot_name,
-                            pred_slot_idx)
-                    
-                    first_position_loss = self.loss_fn(
-                            first_preds, batch.cat_map[slot_name]["first"][pred_slot_idx]
-                    ) * .1
-                    first_position_loss[torch.isnan(first_position_loss)] = 0
-                    second_position_loss = self.loss_fn(
-                            second_preds, batch.cat_map[slot_name]["second"][pred_slot_idx]
-                    ) * .1
-                    second_position_loss[torch.isnan(second_position_loss)] = 0
-                    epoch_pos_loss += (first_position_loss.item() / num_slot)
-                    epoch_pos_loss += (second_position_loss.item() / num_slot)
-
-                    try:
-                        class_loss = self.loss_fn(
-                                predset.cat_map[slot_name]["class"],
-                                batch.cat_map[slot_name]["class"]
-                        ) * .8
-                    except ValueError:
-                        class_loss = check_cuda_float([0])
+                    first_pos_loss, second_pos_loss, num_slot = self.get_pos_loss(
+                            predset, batch, slot_name)
+                    epoch_pos_loss += (first_pos_loss.item() / num_slot)
+                    epoch_pos_loss += (second_pos_loss.item() / num_slot)
+                    class_loss = self.get_cls_loss(predset, batch, slot_name)
 
                     epoch_class_loss += class_loss.item()
-                    loss += first_position_loss + second_position_loss + class_loss
+                    loss += (first_pos_loss * .1) + (second_pos_loss * .1) + \
+                            (class_loss * .8)
 
                 loss.backward()
                 self.optim.step()
             logger.info("Position loss for epoch: %s" % epoch_pos_loss)
             logger.info("Class loss for epoch: %s" % epoch_class_loss)
             logger.info("Dev loss:")
-            devacc = self.predict()
+            self.predict(watch_param=watch_param, **kwargs)
             torch.save(self.state_dict(),
-                    open(f"{MODEL_DIR}bertdst-light-{mode}-{epoch}.pt", "wb")
+                    open(f"{CONFIG['MODEL']['MODEL_DIR']}bertdst-light-{mode}-{epoch}.pt", "wb")
             )
             torch.save(self.bert.state_dict(),
-                    open(f"{MODEL_DIR}light-bertstate-{mode}-{epoch}.pt", "wb")
+                    open(f"{CONFIG['MODEL']['MODEL_DIR']}light-bertstate-{mode}-{epoch}.pt", "wb")
             )
-            #if devacc > best_acc and devacc > .5:
-            #    best_acc = devacc
-            #    torch.save(self.state_dict(), open(f"./bertdst-light-{mode}.pt", "wb"))
-            #    torch.save(self.bert.state_dict(), open(f"./light-bertstate-{mode}.pt", "wb"))
             logger.info("#" * 30)
 
 
-    def develop(self, mode="validate"):
-        self.eval()
-        self.bert.eval()
-        dial_struct = self._fetch_predictset(mode)
-        random.shuffle(dial_struct)
+    @staticmethod
+    def _dst_pred_format(guid, cls_gt, slot):
+        return {
+            "guid": guid,
+            "slot": slot,
+            "class_label_id": cls_gt,
+            "class_prediction": 0,
+            "start_pos": 0,
+            "start_prediction": 0,
+            "end_pos": 0,
+            "end_prediction": 0
+        }
 
-        for dial in dial_struct:
-            goal_labs = {k:True for k in self.slots}
-            for turn in dial:
-                predset = self._get_predset(turn)
-                for slot in ["food", "area", "price range"]:
-                    p_slot = slot if slot != "price range" else "pricerange"
-                    pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
-                    pred_pos = predset.eval_format(p_slot)
+    @staticmethod
+    def _dst_slot_map():
+        return {
+            "none": 0,
+            "dontcare": 1,
+            "copy_value": 2,
+            "unpointable": 3
+        }
 
-                    if pred_cls == 2:
-                        if turn.class_label[slot] != "copy_value":
-                            goal_labs[p_slot] = False
-                            print("Wrong class prediction for dial", turn.session_id)
-                            self._turn_error_print(turn, pred_cls, pred_pos, slot)
-                            print("¤"*30)
-                            print()
-                            input()
-                        else:
-                            print(f"Right class prediction for slot {slot}")
-                            self._turn_error_print(turn, pred_cls, pred_pos, slot)
-                            print("¤"*40)
-                            print()
+    @staticmethod
+    def _dst_first_last_index(entry):
+        first = entry.index(1)
+        for i in [x for x in range(len(entry)) if x != first]:
+            if entry[i] == 1:
+                return first, i
+        return first, first
 
+    def get_prediction_format(self, predset, **kwargs):
+        batch_generator = self.loader.fetch_batch(
+                predset, 1, self.slots, self.tokenizer, pred=True, slot_value_dropout=0
+        )
 
-    def _turn_error_print(self, turn: dataset_dstc2.InputExample,
-                                predicted_class: str,
-                                predicted_idx: int,
-                                slot: str):
-        pred_pos = np.where(np.array(predicted_idx) == 1)[0]
-        pred_value = turn.text_a + turn.text_b
-        pred_slotval = []
-        for p in pred_pos:
-            pred_slotval.append(pred_value[p])
-
-        hit_index = np.array(turn.text_a_label[slot] + turn.text_b_label[slot])
-        hit_goal = np.where(hit_index == 1)[0]
-
-        inp_class_labs = ["none", "dontcare", "copy_value"]
-            
-        print("Predicted class:", predicted_class)
-        print("Actual class:", inp_class_labs.index(turn.class_label[slot]))
-        print("Predicted indexes:", pred_pos)
-        print("Actual indexes:", hit_goal)
-        print("¤"*30)
-        print()
-        print("For slot", slot)
-        print("Turn text_a:", turn.text_a)
-        print("Turn text_b:", turn.text_b)
-        print("Turn text_a_label:", turn.text_a_label)
-        print("Turn text_b_label:", turn.text_b_label)
-        print("For predicted value", " ".join(pred_slotval))
-        print("¤"*30)
-        print()
-        print("Class label:", turn.class_label[slot])
-        print("Indexes to hit:", hit_goal)
-
-
-    def predict_v2(self, mode="validate"):
-        self.eval()
-        self.bert.eval()
-        good, bad = 0, 0
-        dials = self._fetch_predictset(mode)
-        real_set = DataFetcher.fetch_clean_dstc(mode, parse_labels=True)
-        for dial in dials:
-            nully = True
-            corr_slot = {k:True for k in self.slots}
-            predz = {k: "none" for k in self.slots}
-            for turn in dial:
-                slot_plus_idx = {k: 0 for k in self.slots}
-                predset = self._get_predset(turn)
-                predstring = ""
-                for slot in ["food", "area", "price range"]:
-                    p_slot = slot if slot != "price range" else "pricerange"
-                    pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
-                    pred_pos = predset.eval_format(p_slot)
-                    if turn.class_label[slot] == "copy_value":
-                        nully = False
-                        if pred_cls != 2:
-                            predstring += ",bad"
-                            corr_slot[p_slot] = False
-                            continue
-
-                        labs = turn.text_a_label[slot].copy() +\
-                            turn.text_b_label[slot].copy()
-                        while len(labs) < len(pred_pos):
-                            labs.append(0)
-
-                        for xlab, xtext in zip([turn.text_a_label, turn.text_b_label],
-                                    [turn.text_a, turn.text_b]):
-                                if sum(xlab[slot]) > 0:
-                                    rel = np.array(xlab[slot])
-                                    num = np.where(rel == 1)[0]
-                                    tru_idx = []
-                                    for idx in num:
-                                        tru_idx.append(xtext[idx])
-                                    predz[p_slot] = " ".join(tru_idx)
-
-                        if labs != pred_pos:
-                            corr_slot[p_slot] = False
-                            predstring += ",bad"
-                        else:
-                            corr_slot[p_slot] = True
-                            slot_plus_idx[p_slot] = labs
-                            predstring += ",good"
-
-                    elif turn.class_label[slot] == "dontcare":
-                        nully = False
-                        if pred_cls != 1:
-                            predstring += ",bad"
-                            corr_slot[p_slot] = False
-                        else:
-                            corr_slot[p_slot] = True
-                            slot_plus_idx[p_slot] = labs
-                            predstring += ",good"
-                            predz[p_slot] = "dontcare"
-                    else:
-                        if pred_cls != 0:
-                            nully = False
-                            predstring += ",bad"
-                            corr_slot[p_slot] = False
-                        else:
-                            predstring += ",good"
-                            
-                if nully:
+        all_pred_info = {}
+        all_preds = []
+        for p in predset:
+            all_pred_info[p.guid] = {}
+            for slot in [x if x != "pricerange" else "price range" for x in self.slots]:
+                cls = self._dst_slot_map()[p.class_label[slot]]
+                pinfo_slot = slot if slot != "price range" else "pricerange"
+                all_pred_info[p.guid][pinfo_slot] = {}
+                all_pred_info[p.guid][pinfo_slot]["gt_class"] = cls
+                pred_dict = self._dst_pred_format(p.guid, cls, slot)
+                if cls in (0, 1, 3):
+                    all_preds.append(pred_dict)
                     continue
-                if predstring == ",good,good,good" and all(corr_slot.values()):
-                    good += 1
-                    real_goals = [dial for dial in real_set.dialogues
-                            if dial.id == turn.session_id]
-                    real_turn = real_goals[0].turns[int(turn.guid.split("-")[-1])]
-                    real_labs = real_turn.goal_labels
-                    print(turn.session_id)
-                    print("-"*30)
-                    print(turn.text_a)
-                    print(turn.text_b)
-                    print(predz)
-                    print(real_labs)
-                    print("wtf")
-                    input()
+                idxs = p.text_a_label[slot].copy()
+                idxs.extend(p.text_b_label[slot])
+                first, last = self._dst_first_last_index(idxs)
+                pred_dict["start_pos"] = first
+                pred_dict["end_pos"] = last
+                all_pred_info[p.guid][pinfo_slot]["gt_first"] = first
+                all_pred_info[p.guid][pinfo_slot]["gt_second"] = last
 
-                    if predz != real_turn.goal_labels:
-                        for k,v in predz.items():
-                            if k not in real_labs:
-                                print(turn.text_a)
-                                print(turn.text_b)
-                                print(predz)
-                                print(real_labs)
-                                print("wtf")
-                                input()
-                            if real_labs[k] != predz[k]:
-                                if real_labs[k] in SEMANTIC_DICT and v in \
-                                        SEMANTIC_DICT[real_labs[k]]:
-                                            continue
-
-                                print(real_labs)
-                                print(predz)
-                                print(turn.session_id)
-                                input()
-
-                else:
-                    bad += 1
-        print("goods:", good)
-        print("bads:", bad)
-        print("acc:", good/(good + bad))
-
-
-    def predict(self, mode="validate"):
-        self.eval()
-        self.bert.eval()
-        good, bad = 0, 0
+                all_preds.append(pred_dict)
         
-        cls_error_fasit = 0
-        cls_error_pred = 0
-        pos_error = 0
-        dontcare_error = 0
-        slot_misses = FreqDist()
-        dial_struct = self._fetch_predictset(mode)
-        currid = ""
-        lastid = ""
-        eval_json = {}
+        slot_preds = {
+            "food": [],
+            "area": [],
+            "pricerange": []
+        }
+        for batch in tqdm(batch_generator):
+            class_logits, pos_logits = self(batch, train=False, **kwargs)
+            preds = PredictionSet(*class_logits, *pos_logits)
+            guid = batch.guids[0]
+            relevant_p = [x for x in all_preds if x["guid"] == guid]
+            for p in relevant_p:
+                slot = p["slot"] if p["slot"] != "price range" else "pricerange"
+                pred_map = preds.cat_map[slot]
+                cls = pred_map["class"].argmax(-1).item()
+                first = pred_map["first"].argmax(-1).item()
+                second = pred_map["second"].argmax(-1).item()
+                p["class_prediction"] = cls
+                p["start_prediction"] = first
+                p["end_prediction"] = second
+                all_pred_info[guid][slot]["class"] = cls
+                all_pred_info[guid][slot]["first"] = first
+                all_pred_info[guid][slot]["second"] = second
+                slot_preds[slot].append(p)
 
-        for dial_idx, dial in enumerate(dial_struct):
-            eval_json[dial[0].session_id] = []
-            nully = True
-            true_gold_labs = {}
-            preddies =  {}
-            pos_correct = {k:True for k in self.slots}
-            for turn in dial:
-                turn_no = int(turn.guid.split("-")[-1])
-                eval_json[turn.session_id].append({})
-                for k,v in turn.class_label.items():
-                    if v != "none":
-                        true_gold_labs[k] = v
-                    true_gold_labs
-                if currid != turn.session_id:
-                    currid = turn.session_id
+        return slot_preds, all_pred_info, all_preds
 
-                predset = None
-                if len(turn.text_b) > 0:
-                    with torch.no_grad():
-                        txts, asr = self.loader._sort_asr(turn, self.tokenizer)
-                        fbs = FeatureBatchSet([], [], [], [], 
-                                [], [], [], [], {turn.guid: (txts, asr)}, pred=True)
-                        feats = { k: check_cuda_long(v) for k, v in  
-                                self.tokenizer.encode_plus(
-                                    turn.text_a, turn.text_b, return_tensors="pt"
-                                ).items()
-                        }
-                        class_logits, pos_logits = self(fbs, train=False, feats_only=feats)
-                    predset = PredictionSet(*class_logits, *pos_logits)
+    @staticmethod
+    def _calc_fscore(prec, recall):
+        return 2 * ((prec * recall) / (prec + recall))
 
-                for slot in ["food", "area", "price range"]:
-                    p_slot = slot if slot != "price range" else "pricerange"
-                    if predset:
-                        pred_cls = predset.cat_map[p_slot]["class"].argmax(-1).item()
-                        pred_pos = predset.eval_format(p_slot)
-                        if pred_cls == 2:
-                            eval_json[turn.session_id][-1]["pred_pos"] = \
-                                    [pred_pos.index(l) for l in pred_pos if l > 0]
+    @staticmethod
+    def _get_recall(tp, fn):
+        return tp / (tp + fn)
 
-                    else:
-                        pred_cls = 0
+    @staticmethod
+    def _get_prec(tp, fp):
+        return tp / (tp + fp)
 
-                    if pred_cls > 0:
-                        preddies[slot] = pred_cls
-                    if turn.class_label[slot] == "copy_value":
-                        nully = False
-                        labs = turn.text_a_label[slot].copy()
-                        labs.extend(turn.text_b_label[slot])
-                        while len(labs) < len(pred_pos):
-                            labs.append(0)
+    def get_prediction_dump(self, slot_preds):
+        """
+        Need to keep track of the following:
+            1) At which turn in the dialogue does the model fail
+            2) Which slot fails
+            3) Is it a false positive, wrong prediction, or false negative
+            4) 3, for each slot
 
-                        eval_json[turn.session_id][-1]["goal_pos"] = \
-                                [labs.index(l) for l in labs if l > 0]
-
-                        if pred_cls != 2:
-                            pos_correct[p_slot] = False
-                            cls_error_fasit += 1
-                            slot_misses[slot] += 1
-                            continue
+        input is [
+            {
+                gucci
+                guid
+                slot
+                class_label_id
+                class_prediction
+                start_pos
+                start_prediction
+                end_pos
+                end_prediction
+            }
+        ]
+        """
+        dump = PredictionDump()
+        for turn_idx in range(len(slot_preds["food"])):
+            for slot in self.slots:
+                dump.assign_turn(slot_preds[slot][turn_idx])
+        print(len(dump.dialogues))
+        return dump
 
 
+    @staticmethod
+    def _turn_iscurr(turn, curr):
+        return int(turn["guid"].split("-")[1]) == curr
 
-                        if labs != pred_pos:
-                            pos_correct[p_slot] = False
-                            pos_error += 1
-                        else:
-                            pos_correct[p_slot] = True
-
-                    elif turn.class_label[slot] == "dontcare":
-                        nully = False
-                        if pred_cls != 1:
-                            pos_correct[p_slot] = False
-                            dontcare_error += 1
-                            slot_misses[slot] += 1
-                        else:
-                            pos_correct[p_slot] = True
-                    elif turn.class_label[slot]:
-                        if pred_cls != 0:
-                            slot_misses[slot] += 1
-                            pos_correct[slot] = False
-                            nully = False
-                            cls_error_pred += 1
-                            continue
-                eval_json[turn.session_id][-1]["transcript"] = turn.text_b
-                for k,v in preddies.items():
-                    eval_json[turn.session_id][-1][f"pred_{k}"] = v
-                map = {
-                    "copy_value": 2,
-                    "none": 0,
-                    "dontcare": 1,
-                    "unpointable": 3
-                }
-                for k,v in true_gold_labs.items():
-                    eval_json[turn.session_id][-1][f"real_{k}"] = map[v]
-                if nully:
-                    eval_json[turn.session_id][-1]["status"] = "null"
+    def get_distance_measures(self, mode="validate", **kwargs):
+        self.eval()
+        self.bert.eval()
+        predset = self.preprep.fetch_set(mode, 
+                use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"], 
+                exclude_unpointable=False
+        )
+        slot_preds, all_pred_info, all_preds = \
+                self.get_prediction_format(predset, **kwargs)
+        counts = {s: {"first":[],"second":[]} for s in self.slots}
+        for slot, turns in slot_preds.items():
+            for t in turns:
+                if t["class_label_id"] != 2 or t["class_prediction"] != 2:
                     continue
-                if all(pos_correct.values()):
-                    good += 1
-                    eval_json[turn.session_id][-1]["status"] = "good"
+                counts[slot]["first"].append(
+                        abs(t["start_pos"] - t["start_prediction"])
+                )
+                counts[slot]["second"].append(
+                        abs(t["end_pos"] - t["end_prediction"])
+                )
+        for slot, nums in counts.items():
+            first_miss_rate = \
+                    len([x for x in nums["first"] if x > 0]) / len(nums["first"])
+            second_miss_rate = \
+                    len([x for x in nums["second"] if x > 0]) / len(nums["second"])
+            print(f"For slot {slot}")
+            print("Mean of first errors: %s" % np.median(nums["first"]))
+            print("Mean of second errors: %s" % np.median(nums["second"]))
+            print("Mean of first errors, errors only: %s" % np.median(
+                [x for x in nums["first"] if x > 0]))
+            print("Mean of second errors, errors only: %s" % np.median(
+                [x for x in nums["second"] if x > 0]))
+            print("Number of misses, first: %s" % len(
+                [x for x in nums["first"] if x > 0]))
+            print("Number of misses, second: %s" % len(
+                [x for x in nums["second"] if x > 0]))
+            print("Miss rate, first: %s" % first_miss_rate)
+            print("Miss rate, second: %s" % second_miss_rate)
+
+    def get_cer(self, mode="validate", no_blanks=False, **kwargs):
+        self.eval()
+        self.bert.eval()
+        predset = self.preprep.fetch_set(mode, 
+                use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"], 
+                exclude_unpointable=False
+        )
+        slot_preds, all_pred_info, all_preds = \
+                self.get_prediction_format(predset, **kwargs)
+        total_score = 0
+        blank_count = 0
+        num_turns = len(slot_preds["food"])
+        for turn_idx in range(num_turns):
+            score = 1
+            turn_isblank = 0
+            for slot in self.slots:
+                turn_pred = slot_preds[slot][turn_idx]
+                if turn_pred["class_label_id"] != turn_pred["class_prediction"]:
+                    score -= .33
+                elif turn_pred["class_label_id"] == 0 and no_blanks:
+                    turn_isblank += 1
+            if (no_blanks and turn_isblank < 3) or not no_blanks:
+                total_score += score
+            else:
+                blank_count += 1
+        if no_blanks:
+            noblank_score = total_score / (num_turns - blank_count)
+            print("CER without blanks: %s" % noblank_score)
+        else:
+            print("Combined concept error rate: %s" % (total_score / num_turns))
+
+    def get_average_perplexity(self, mode="validate", **kwargs):
+        self.eval()
+        self.bert.eval()
+        predset = self.preprep.fetch_set(mode, 
+                use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"], 
+                exclude_unpointable=False
+        )
+        batch_generator = self.loader.fetch_batch(
+                predset, 1, self.slots, self.tokenizer, pred=True, slot_value_dropout=0
+        )
+        class_perplexity = {s: [] for s in self.slots}
+        avg_class_perplexity = 0
+        avg_pos_perplexity = 0
+        for batch in tqdm(batch_generator):
+            class_logits, pos_logits = self(batch, train=False, **kwargs)
+            for slot, slot_logits in zip(self.slots, class_logits):
+                logval = np.log2(
+                            np.max(slot_logits[0].cpu().detach().numpy())
+                        )
+                logval = logval if not np.isnan(logval) else 0
+                class_perplexity[slot].append(logval)
+
+        for slot, vals in class_perplexity.items():
+            print("perplexity for %s: %s" % (slot, 2**(-(sum(vals) * (1/len(vals))))))
+
+        return class_perplexity
+
+    def get_f_score(self, mode="validate", **kwargs):
+        self.eval()
+        self.bert.eval()
+        predset = self.preprep.fetch_set(mode, 
+                use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"], 
+                exclude_unpointable=False
+        )
+        slot_preds, all_pred_info, all_preds = \
+                self.get_prediction_format(predset, **kwargs)
+
+        counts = ConditionalFreqDist()
+        for slot, turns in slot_preds.items():
+            for t in turns:
+                if t["class_label_id"] == t["class_prediction"] and t["class_prediction"] == 0:
+                    continue
+                if t["class_label_id"] == t["class_prediction"]:
+                    counts[slot]["tp"] += 1
+                elif t["class_prediction"] != t["class_label_id"] and t["class_label_id"] == 0:
+                    counts[slot]["fp"] += 1
                 else:
-                    eval_json[turn.session_id][-1]["status"] = "bad"
-                    bad += 1
-        if mode == "test":
-            json.dump(eval_json, open("./evaljson.json", "w"))
-        logger.info("#"*30)
-        logger.info("Slots missed:")
-        for k,v in slot_misses.most_common():
-            logger.info(f"{k}: {v} times")
-        logger.info("class fasit error: %s" % cls_error_fasit)
-        logger.info("class pred error: %s" % cls_error_pred)
-        logger.info("dontcare error: %s" % dontcare_error)
-        logger.info("pos error: %s" % pos_error)
-        logger.info("good cnt: %s" % good)
-        logger.info("bad cnt: %s" % bad)
-        logger.info(str(good/(good+bad)))
-        logger.info("#"*30)
-        return good/(good+bad)
+                    counts[slot]["fn"] += 1
+        print("results:")
+        print(counts.tabulate())
+        for slot, res in counts.items():
+            print(f"for slot {slot}:")
+            prec = self._get_prec(res["tp"], res["fp"])
+            recall = self._get_recall(res["tp"], res["fn"])
+            f_score = self._calc_fscore(prec, recall)
+            print("Precision: %s\t recall: %s\t f-score: %s" % (prec, recall, f_score))
 
-    def forward(self, X, train=True, feats_only=None):
+    def predict(self, mode="validate", watch_param=False, **kwargs):
+        self.eval()
+        self.bert.eval()
+        predset = self.preprep.fetch_set(mode, 
+                use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"], 
+                exclude_unpointable=False
+        )
 
-        bsize = self.train_bsize if train else 1
-        comb = check_cuda_float(torch.zeros((bsize, self.emb_dim)))
-        dial_idx = -1
-        curr_dial = ""
-        for dial, feats in X.asr_feats.items():
-            bert_dict, asr = feats
-            if curr_dial != dial:
-                curr_dial = dial
-                dial_idx += 1
-            _, new_comb = self.bert(**bert_dict).to_tuple()
-            for ns in range(len(asr)):
-                comb[dial_idx] += (new_comb[ns] * asr[ns])
+        slot_preds, all_pred_info, all_preds = \
+                self.get_prediction_format(predset, **kwargs)
+        tot_corrs, joint_acc = self.report_predict(slot_preds)
+        if watch_param:
+            where_wrong = np.where(joint_acc == 0)[0]
+            for num_idx, wrong_idx in enumerate(where_wrong):
+                turn = predset[wrong_idx]
+                guid = turn.guid
+                logger.info("For turn with guid %s" % guid)
+                logger.info(" ".join(turn.text_a))
+                logger.info(" ".join(turn.text_b))
+                logger.info("_"*30)
+                logger.info("Predictions:")
+                for slot in self.slots:
+                    gt_slot = "price range" if slot == "pricerange" else slot
+                    gt_cls = self._dst_slot_map()[turn.class_label[gt_slot]]
+                    pred_cls = all_pred_info[guid][slot]["class"]
+                    logger.info("¤"*30)
+                    logger.info("For slot %s with pred class %s and ground truth %s" % (slot, pred_cls, gt_cls))
+                    logger.info("With result %s" % tot_corrs[slot][wrong_idx])
+                    if gt_cls != pred_cls:
+                        logger.info("Wrong class prediction, no idx needed")
+                        continue
+                    if gt_cls != 2:
+                        prev_wrong_idx = where_wrong[num_idx-1]
+                        prev_wrong_guid = predset[prev_wrong_idx].guid
+                        if prev_wrong_guid == guid and tot_corrs[slot][prev_wrong_idx] == 0:
+                            logger.info("Carried over bad label from previous turn.")
+                            continue
+                            
+                        logger.info("No idx, got it right")
+                        continue
+                    logger.info("real idx:", all_pred_info[guid][slot]["gt_first"], 
+                            all_pred_info[guid][slot]["gt_second"])
+                    logger.info("pred_idxs:", all_pred_info[guid][slot]["first"],
+                            all_pred_info[guid][slot]["second"])
+                    logger.info("_"*30)
+                logger.info("#"*30)
+                stop_cont = input()
+                if stop_cont == "stop":
+                    break
+        joint_acc = np.mean(joint_acc)
+        logger.info("Joint accuracy: %s" % joint_acc)
+
+
+    @staticmethod
+    def report_predict(pred_dict: {str: [int]}):
+        joint_acc = 1
+        tot_corrs = {}
+        for slot, preds in pred_dict.items():
+            logger.info("For slot %s" % slot)
+            tot_corr, class_corr, pos_corr = get_joint_slot_correctness(preds,
+                    ignore_file=True)
+            tot_corrs[slot] = tot_corr
+            joint_acc *= tot_corr
+            logger.info("total correct: %s" % np.mean(tot_corr))
+            logger.info("class correct: %s" % np.mean(class_corr))
+            logger.info("pos correct %s" % np.mean(pos_corr))
+        return tot_corrs, joint_acc
+
+    @staticmethod
+    def filter_bert_dict(bert_dict, asrs):
+        """
+        It is best to filter out the utterances under the elected 
+        ASR threshold before running it through the BERT model, to reduce
+        impact on resources.
+        """
+        new_dict = {k: [] for k in bert_dict.keys()}
+        for input_type, values in bert_dict.items():
+            for num_iter, (asr, value) in enumerate(zip(asrs, values)):
+                if num_iter == 0 or asr > CONFIG["MODEL"]["ASR_THRESHOLD"]:
+                    new_dict[input_type].append(value)
+        
+        return {k: check_cuda_stack_long(v) for k,v in new_dict.items()}
             
-        seq, _ = self.bert(**X.to_bert_format()).to_tuple() if feats_only is None else \
-                self.bert(**feats_only).to_tuple()
+    
+    def weighted_calc(self, X, bsize):
+        """
+        Calculate the weighted sum of the ASR vectors.
+        """
+        comb = torch.zeros((bsize, self.emb_dim), requires_grad=True).to(self.device)
+        seq = torch.zeros((bsize, CONFIG["MODEL"]["SENT_MAX_LEN"], self.emb_dim), requires_grad=True).to(self.device)
+        dial_idx = -1
+        for dial, feats in X.asr_feats.items():
+            dial_idx += 1
+            bert_dict, asr = feats
+            bert_dict = self.filter_bert_dict(bert_dict, asr)
+            new_seq , new_comb = self.bert(**bert_dict).to_tuple()
+            if (torch.sum(bert_dict["input_ids"][X.text_indexes[dial_idx]])
+                !=
+                torch.sum(X.to_bert_format()["input_ids"][dial_idx])
+            ):
+                print(dial_idx)
+                print(bert_dict["input_ids"])
+                print(X.to_bert_format()["input_ids"][dial_idx])
+                print(dial)
+                input()
+            for new_entry in range(new_comb.size(0)):
+                comb[dial_idx] += (new_comb[new_entry] * asr[new_entry])
+            seq[dial_idx] = new_seq[X.text_indexes[dial_idx]]
+        return seq, comb
+        
+    def _get_output(self, X, bsize, weighted):
+        return self.weighted_calc(X, bsize) if weighted else \
+                self.bert(**X.to_bert_format()).to_tuple()
+        
 
+    def forward(self, X, train=True, weighted=False):
+
+        bsize = CONFIG["MODEL"]["TRAIN_BATCH_SIZE"] if train else 1
+        
+        seq, comb = self._get_output(X, bsize, weighted)
         if train:
             comb = self.dropout(comb)
             seq = self.dropout(seq)
@@ -713,52 +915,54 @@ class BertNet(nn.Module):
         area_ab = self.alphabeta_area(seq)
         price_ab = self.alphabeta_price(seq)
 
-        def get_alphabeta(tensor):
-            alphamax = tensor[:, :, 0]
-            betamax = tensor[:, :, 1]
-            return alphamax, betamax
-
-        foodstart, foodend = get_alphabeta(food_ab)
-        areastart, areaend = get_alphabeta(area_ab)
-        pricestart, priceend = get_alphabeta(price_ab)
+        get_alphabeta = lambda x: (x[:, :, 0], x[:, :, 1])
 
         return ((a_food, a_area, a_price),
-                ((foodstart, foodend),
-                (areastart, areaend),
-                (pricestart, priceend)))
+                (get_alphabeta(food_ab),
+                get_alphabeta(area_ab),
+                get_alphabeta(price_ab)))
 
-    def _get_predset(self, turn, train=False):
-        with torch.no_grad():
-            class_logits, pos_logits = self(
-                { k: check_cuda_long(v) for k, v in  
-                    self.tokenizer.encode_plus(
-                        turn.text_a, turn.text_b, return_tensors="pt"
-                    ).items()
-                }, train=train
-            )
-            return PredictionSet(*class_logits, *pos_logits)
+    def _setup_loss_activation(self):
+        self.activation = nn.Sigmoid()
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(p=CONFIG["MODEL"]["DROPOUT"])
+        self.cl_loss_fn = nn.CrossEntropyLoss()
+        self.pos_loss_fn = nn.CrossEntropyLoss()
+        if self.is_cuda:
+            self.bert.cuda()
+            self.softmax.cuda()
+            self.cl_loss_fn.cuda()
+            self.pos_loss_fn.cuda()
 
-    def _fetch_predictset(self, mode):
-        """
-        Helper function to generate a featureset for the predict and develop functions.
-        """
-        featureset = self.preprep.fetch_set(mode, use_asr_hyp=5, exclude_unpointable=False)
-        dial_struct = []
-        current_id = ""
-        current_dial = []
-        for turn in featureset:
-            _, dial_no, turn_no = turn.guid.split("-")
-            if dial_no != current_id:
-                current_id = dial_no
-                if len(current_dial) > 0:
-                    dial_struct.append(sorted(current_dial, key=lambda x: turn_no))
-                    current_dial = []
-                current_dial.append(turn)
-            else:
-                current_dial.append(turn)
-        else:
-            dial_struct.append(sorted(current_dial, key= lambda x: turn_no))
-        return dial_struct
+        self.optim = Adam(self.parameters(), lr=CONFIG["MODEL"]["LEARN_RATE"])
+
+
+    def _setup_bert(self):
+        self.tokenizer = BertTokenizer.from_pretrained(CONFIG["MODEL"]["BERT_VERSION"])
+        #self.tokenizer = self.loader.tokenizer
+        self.bert = BertModel.from_pretrained(CONFIG["MODEL"]["BERT_VERSION"])
+        if self.is_cuda:
+            self.bert.cuda()
+
+
+    def _setup_layers(self):
+        self.food_a = nn.Linear(self.emb_dim, 3)
+        self.area_a = nn.Linear(self.emb_dim, 3)
+        self.price_a = nn.Linear(self.emb_dim, 3)
+
+        self.alphabeta_food = nn.Linear(self.emb_dim, 2)
+        self.alphabeta_area = nn.Linear(self.emb_dim, 2)
+        self.alphabeta_price = nn.Linear(self.emb_dim, 2)
+
+        if self.is_cuda:
+            self.food_a.cuda()
+            self.area_a.cuda()
+            self.price_a.cuda()
+            self.alphabeta_food.cuda()
+            self.alphabeta_area.cuda()
+            self.alphabeta_price.cuda()
+
+
 
 
 def check_cuda_float(list_like):
@@ -791,10 +995,12 @@ def _check_cuda_stack_both(list_like, function):
     if len(list_like) == 0:
         return torch.tensor([])
 
-    if isinstance(list_like[0], list):
+    if isinstance(list_like[0], list) or isinstance(list_like[0], np.ndarray):
         converted = [function(x) for x in list_like]
     elif isinstance(list_like[0], int):
         converted = [function(list_like)]
+    else:
+        converted = list_like
     return converted
 
 
@@ -845,8 +1051,8 @@ class PredictionSet:
         try:
             vals[sec_idx] = 1
         except IndexError:
-            print("wtf")
-            print(sec_idx)
+            logger.info("wtf")
+            logger.info(sec_idx)
         return vals
 
     def pred_idx(self, cat, idx):
@@ -889,41 +1095,43 @@ class PredictionSet:
 class FeatureBatchSet:
 
     def __init__(self, inputs, masks, types, starts, ends, food_labels, area_labels,
-            price_labels, all_feats, pred=False):
+                 price_labels, all_feats, text_indexes, pred=False):
         
-        if not pred:
-            self.inputs = check_cuda_stack_long(inputs)
-            self.masks = check_cuda_stack_long(masks)
-            self.types = check_cuda_stack_long(types)
+        self.inputs = check_cuda_stack_long(inputs)
+        self.masks = check_cuda_stack_long(masks)
+        self.types = check_cuda_stack_long(types)
 
-            self.food_start = check_cuda_long(starts["food"])
-            self.food_end = check_cuda_long(ends["food"])
-            self.area_start = check_cuda_long(starts["area"])
-            self.area_end = check_cuda_long(ends["area"])
-            self.price_start = check_cuda_long(starts["pricerange"])
-            self.price_end = check_cuda_long(ends["pricerange"])
+        self.food_start = check_cuda_long(starts["food"])
+        self.food_end = check_cuda_long(ends["food"])
+        self.area_start = check_cuda_long(starts["area"])
+        self.area_end = check_cuda_long(ends["area"])
+        self.price_start = check_cuda_long(starts["pricerange"])
+        self.price_end = check_cuda_long(ends["pricerange"])
 
-            self.food_class = check_cuda_long(food_labels)
-            self.area_class = check_cuda_long(area_labels)
-            self.price_class = check_cuda_long(price_labels)
-            
-            self.cat_map = {
-                    "food": {
-                        "class": self.food_class,
-                        "first": self.food_start,
-                        "second": self.food_end
-                    },
-                    "area": {
-                        "class": self.area_class,
-                        "first": self.area_start,
-                        "second": self.area_end
-                    },
-                    "pricerange": {
-                        "class": self.price_class,
-                        "first": self.price_start,
-                        "second": self.price_end
-                    }
-            }
+        self.food_class = check_cuda_long(food_labels)
+        self.area_class = check_cuda_long(area_labels)
+        self.price_class = check_cuda_long(price_labels)
+
+        self.text_indexes = text_indexes
+        
+        self.cat_map = {
+                "food": {
+                    "class": self.food_class,
+                    "first": self.food_start,
+                    "second": self.food_end
+                },
+                "area": {
+                    "class": self.area_class,
+                    "first": self.area_start,
+                    "second": self.area_end
+                },
+                "pricerange": {
+                    "class": self.price_class,
+                    "first": self.price_start,
+                    "second": self.price_end
+                }
+        }
+        self.guids = list(all_feats.keys())
         self.asr_feats = self._format_all_feats(all_feats)
 
     def idx_for_cat(self, cat):
@@ -946,6 +1154,118 @@ class FeatureBatchSet:
         return dicty
 
 
+class PredictionDump:
+
+    def __init__(self):
+        self.dialogues: [PredictionDialogue] = []
+        self.current_dial = None
+
+    def assign_turn(self, turn):
+        turn_guid = turn["guid"]
+        if self.got_dial(turn_guid):
+            self.current_dial.add_turn(turn)
+        else:
+            dial = PredictionDialogue()
+            self.dialogues.append(dial)
+            self.current_dial = dial
+            dial.add_turn(turn)
+
+    def got_dial(self, guid):
+        if not self.current_dial:
+            return False
+        return self.current_dial.is_dial(guid)
+
+    def to_json(self):
+        return [d.to_json() for d in self.dialogues]
+
+
+
+
+class PredictionDialogue:
+
+    def __init__(self):
+        self.turns: [PredictionTurn] = []
+        self.dial_idx = None
+        self.is_perfect = True
+        self.current_turn = None
+
+    def add_turn(self, turn: {str: int}):
+        if self.got_turn(turn["guid"]):
+            self.current_turn.update(
+                turn["slot"], 
+                turn["class_label_id"], 
+                turn["class_prediction"]
+            )
+        else:
+            t = PredictionTurn(turn)
+            self.turns.append(t)
+            self.current_turn = t
+            self.dial_idx = int(turn["guid"].split("-")[1])
+            t.update(
+                turn["slot"], 
+                turn["class_label_id"], 
+                turn["class_prediction"]
+            )
+
+    def find_first_fail(self):
+        """
+        Return first turn that 
+        """
+        goods = list(sorted(
+            filter(lambda t: not t.is_good(), self.turns), key=lambda t: t.turn_idx 
+        ))
+        return goods[0] if len(goods) else \
+                list(sorted(self.turns, key=lambda t: t.turn_idx))[-1]
+
+    def got_turn(self, guid):
+        if not self.current_turn:
+            return False
+        return self.current_turn.is_turn(guid)
+
+    def is_dial(self, guid):
+        return int(guid.split("-")[1]) == self.dial_idx
+
+    def to_json(self):
+        d = { "dial_idx": self.dial_idx }
+        any_failed = [t for t in self.turns if t.is_good()]
+        if len(any_failed) == len(self.turns):
+            d["fail"] = False
+            d["fail_idx"] = -1
+        else:
+            first_failed = self.find_first_fail()
+            d["fail"] = True
+            d["fail_idx"] = first_failed.turn_idx
+            d["fail_slots"] = [k for k,v in first_failed.slots.items() if not v]
+        d["turns"] = [t.to_json() for t in self.turns]
+        return d
+
+
+
+class PredictionTurn:
+    
+    def __init__(self, turn_dict):
+        self.guid = turn_dict["guid"]
+        self.turn_idx = int(self.guid.split("-")[-1])
+        self.slots = {
+            "food": True,
+            "area": True,
+            "pricerange": True
+        }
+
+    def is_good(self):
+        return all(self.slots.values())
+
+    def update(self, slot, class_label, class_pred):
+        self.slots[slot] = (class_label == class_pred)
+
+    def is_turn(self, guid):
+        return int(guid.split("-")[-1]) == self.turn_idx
+
+    def to_json(self):
+        d = { "guid": self.guid }
+        d.update(self.slots)
+        return d
+
 
 def pad_to_max_len(tokens, max_len, pad_token):
     while len(tokens) != max_len:
@@ -953,25 +1273,50 @@ def pad_to_max_len(tokens, max_len, pad_token):
     return tokens
 
 
-if __name__ == '__main__':
-    import sys
+def load_model_state(model, dataset, number):
+    model.load_state_dict(torch.load(f"{CONFIG['MODEL']['MODEL_DIR']}bertdst-light-{dataset}-{number}.pt"))
+    model.bert.load_state_dict(torch.load(f"{CONFIG['MODEL']['MODEL_DIR']}light-bertstate-{dataset}-{number}.pt"))
 
-    arg = sys.argv[1]
+
+if __name__ == '__main__':
+    from argparse import ArgumentParser
+    import sys
+    import os
+
+    parser = ArgumentParser()
+    parser.add_argument("mode", type=str)
+    parser.add_argument("--set", type=str, required=False, default="train")
+    parser.add_argument("--log", action='store_true')
+    parser.add_argument("--single", type=str, required=False)
+    parser.add_argument("--continue_from", type=int, required=False, default=-1)
+    parser.add_argument("--weighted", action='store_true')
+
+    args = parser.parse_args()
+
+    mode = args.mode
+    dataset = args.set
     bn = BertNet()
-    if arg in ("train", "majority", "snorkel", "majority_pattern_matching",
-            "snorkel_pattern_matching"):
-        bn.fit(mode=arg)
-    elif arg in ("validate", "test", "majority_test", "majority_pattern_matching_test",
-            "snorkel_test", "snorkel_pattern_matching_test"):
-        predmode = "test" if arg != "validate" else arg
-        if arg in ("test", "validate"):
-            arg = "train"
-        if len(arg.split("_")) == 2:
-            arg = arg.split("_")[0]
-        arg = arg if arg != "test" else "train"
-        for ep in range(bn.epochs):
-            print("For model # %s" % ep)
-            bn.load_state_dict(torch.load(f"{MODEL_DIR}bertdst-light-{arg}-{ep}.pt"))
-            bn.bert.load_state_dict(torch.load(f"{MODEL_DIR}light-bertstate-{arg}-{ep}.pt"))
-            bn.predict(mode=predmode)
+    if mode == "train":
+        cont_from = max(args.continue_from, -1)
+        if cont_from >= 0:
+            load_model_state(bn, dataset, cont_from)
+        bn.fit(mode=dataset, continue_from=cont_from+1, weighted=args.weighted,
+                watch_param=args.log)
+    elif mode in ("test", "validate"):
+        if args.single:
+            load_model_state(bn, dataset, args.single)
+            bn.predict(mode=mode, watch_param=args.log, weighted=args.weighted)
+        else:
+            for ep in range(CONFIG["MODEL"]["NUM_EPOCHS"]):
+                if not\
+                    os.path.exists(f'{CONFIG["MODEL"]["MODEL_DIR"]}bertdst-light-{dataset}-{ep}.pt'):
+                        logger.info("FINISHED AT EPOCH %s" % ep)
+                        sys.exit(0)
+
+                logger.info("For model # %s" % ep)
+                load_model_state(bn, dataset, ep)
+                bn.predict(mode=mode, watch_param=args.log, weighted=args.weighted)
+    else:
+        logger.info("Mode must be either train, validate, or test")
+        sys.exit(1)
 
