@@ -37,6 +37,11 @@ def get_token_label_ids(token_labels_a, token_labels_b, max_seq_length):
   while len(token_label_ids) < max_seq_length:
     token_label_ids.append(0)
 
+  if len(token_label_ids) != max_seq_length:
+      print(token_label_ids)
+      print(max_seq_length)
+      print(len(token_label_ids))
+      token_label_ids = token_label_ids[:max_seq_length]
   assert len(token_label_ids) == max_seq_length
   return token_label_ids
 
@@ -119,6 +124,10 @@ def get_bert_input(tokens_a, tokens_b, max_seq_length, tokenizer):
     input_ids.append(0)
     input_mask.append(0)
     segment_ids.append(0)
+
+  input_ids = input_ids[:max_seq_length]
+  input_mask = input_mask[:max_seq_length]
+  segment_ids = segment_ids[:max_seq_length]
 
   assert len(input_ids) == max_seq_length
   assert len(input_mask) == max_seq_length

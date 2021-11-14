@@ -193,7 +193,7 @@ def create_examples(dialog_filename, slot_list, set_type, use_asr_hyp=0,
             text_a_label=sys_utt_tok_label_dict,
             text_b_label=usr_utt_tok_label_dict,
             class_label=class_type_dict,
-            session_id=dial["session-id"],
+            session_id="test123",#dial["session-id"],
             asr_score=asr_score,
             turn_labels=turn["turn_label"]))
   return examples

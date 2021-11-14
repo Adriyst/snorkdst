@@ -21,7 +21,7 @@ class Bar:
 
 class BarPlotter:
 
-    BAR_MIN_LIMIT = 10
+    BAR_MIN_LIMIT = 0
 
     def __init__(self):
         self.datas = []

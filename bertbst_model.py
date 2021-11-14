@@ -102,6 +102,8 @@ class PrePrepped:
         self.snorkel_pattern_matching_set = None
         self.snorkel_test_set = None
         self.snorkel_validate_set = None
+        self.woz_validate = None
+        self.woz_test = None
 
     def compare_sets(*args) -> ({str:[int]}, [int]):
         return BertNet.report_predict(*args)
@@ -188,7 +190,9 @@ class PrePrepped:
             "snorkel": self.snorkel_set,
             "snorkel_pattern_matching": self.snorkel_pattern_matching_set,
             "snorkel_test": self.snorkel_test_set,
-            "snorkel_validate": self.snorkel_validate_set
+            "snorkel_validate": self.snorkel_validate_set,
+            "woz_validate": self.woz_validate,
+            "woz_test": self.woz_test
         }
         relevant_set = loaded_map[version]
         if relevant_set:
@@ -201,11 +205,19 @@ class PrePrepped:
             "majority_test": "test",
             "snorkel_test": "test",
             "majority_validate": "dev",
-            "snorkel_validate": "dev"
+            "snorkel_validate": "dev",
+            "woz_validate": "dev",
+            "woz_test": "test"
         }
         version_type = mode_map[version] if version in mode_map else mode_map["train"]
+        path = "%s_%s_en.json"
+        use_woz = "woz" if "woz" in version else "dstc"
+        if use_woz == "woz":
+            use_path = path % (use_woz, version.split("_")[1])
+        else:
+            use_path = f"dstc2_{version}_en.json"
         loaded_set = dataset_dstc2.create_examples(
-            os.path.join(CONFIG["MODEL"]["DATASETPATH"], f"dstc2_{version}_en.json"),
+            os.path.join(CONFIG["MODEL"]["DATASETPATH"], use_path),
                 self.SLOTS, version_type, **kwargs
         )
         grouped_set = self._group_set(loaded_set)
@@ -461,11 +473,16 @@ class BertNet(nn.Module):
         """
         Class loss should account for 80% of the loss. Returns 0 loss if there 
         are no entries in the batch with class = 2.
+        If the batch generator is set to not exclude unpointables, it will include class =
+        3 in those cases. Model can only reason over 3 classes, so set to 0. Won't affect
+        training.
         """
         try:
+            batch_value = batch.cat_map[slot_name]["class"]
+            batch_value = batch_value if batch_value < 3 else check_cuda_long(0)
             class_loss = self.cl_loss_fn(
                     predset.cat_map[slot_name]["class"],
-                    batch.cat_map[slot_name]["class"]
+                    batch_value
             ) * .8
         except ValueError:
             class_loss = check_cuda_float([0])
@@ -555,6 +572,45 @@ class BertNet(nn.Module):
             if entry[i] == 1:
                 return first, i
         return first, first
+
+    def get_loss_for_set(self, mode="validate", **kwargs):
+        self.eval()
+        self.bert.eval()
+        predset = self.preprep.fetch_set(mode, 
+            use_asr_hyp=CONFIG["MODEL"]["ASR_HYPS"],
+            exclude_unpointable=False
+        )
+
+        batch_generator = self.loader.fetch_batch(
+            predset, 1, self.slots, self.tokenizer, pred=True, slot_value_dropout=0
+        )
+        class_loss = 0
+        pos_loss = 0
+        loss = {"pos": [], "class": []}
+        for batch in tqdm(batch_generator):
+            with torch.no_grad():
+                class_logits, pos_logits = self(batch, train=False, **kwargs)
+                preds = PredictionSet(*class_logits, *pos_logits)
+                for slot_name in preds.categories:
+                    first_pos_loss, second_pos_loss, num_slot = self.get_pos_loss(
+                            preds, batch, slot_name)
+                    pos_loss += (first_pos_loss.item() / num_slot)
+                    pos_loss += (second_pos_loss.item() / num_slot)
+                    batch_class_loss = self.get_cls_loss(preds, batch, slot_name)
+
+                    class_loss += batch_class_loss.item()
+                    loss["pos"].append(pos_loss)
+                    loss["class"].append(class_loss)
+
+        print(f"Class loss: {class_loss}, Pos loss: {pos_loss}")
+        print(f"Relative class loss: {class_loss / len(predset)}, Pos loss:\
+                {pos_loss/len(predset)}")
+        return {
+            "class loss": class_loss,
+            "pos loss": pos_loss,
+            "rel class loss": class_loss / len(predset),
+            "rel pos loss": pos_loss / len(predset)
+        }, loss
 
     def get_prediction_format(self, predset, **kwargs):
         batch_generator = self.loader.fetch_batch(
